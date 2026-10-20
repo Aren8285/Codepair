@@ -1,0 +1,12 @@
+{
+  "name": "codepair-e2e",
+  "private": true,
+  "type": "module",
+  "description": "Two-client browser test for a running CodePair session",
+  "scripts": {
+    "start": "node browser.mjs"
+  },
+  "dependencies": {
+    "puppeteer-core": "^23.0.0"
+  }
+}
