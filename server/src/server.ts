@@ -351,7 +351,8 @@ export async function createCodepairServer(config: ServerConfig): Promise<Codepa
 /**
  * Production accepts same-origin and explicitly configured origins. In Vite
  * development the browser talks to port 5180 (often through a LAN address),
- * so any loopback/private-network origin on the dev server's port is allowed.
+ * so any loopback/private-network origin on the dev server's port is allowed
+ * regardless of protocol (HTTP or HTTPS, since we now enable SSL in Vite).
  * A valid access token is still required in every case.
  */
 function isUpgradeOriginAllowed(origin: string | undefined, host: string | undefined, config: ServerConfig): boolean {

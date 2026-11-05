@@ -88,7 +88,9 @@ async function main(): Promise<void> {
     }
     lines.push('');
     if (config.host === '0.0.0.0' || config.host === '::') {
-      for (const url of networkUrls(config.token, port, config.roomId)) lines.push(`  Network   ${url}`);
+      const lanPort = config.devClientUrl ? new URL(config.devClientUrl).port || port : port;
+      const lanProtocol = config.devClientUrl?.startsWith('https') ? 'https' : 'http';
+      for (const url of networkUrls(config.token, Number(lanPort), config.roomId, lanProtocol)) lines.push(`  Network   ${url}`);
       lines.push('');
       lines.push('  \u001b[33mAnyone on this network with the link has the access you granted.\u001b[0m');
       lines.push('  \u001b[33mUse read-only mode for demos; prefer a VPN or trusted LAN.\u001b[0m');
@@ -124,13 +126,13 @@ async function main(): Promise<void> {
   process.once('SIGTERM', () => void shutdown('SIGTERM'));
 }
 
-function networkUrls(token: string, port: number, roomId: string): string[] {
+function networkUrls(token: string, port: number, roomId: string, protocol = 'http'): string[] {
   const urls: string[] = [];
   const interfaces = os.networkInterfaces();
   for (const addresses of Object.values(interfaces)) {
     for (const address of addresses ?? []) {
       if (address.family === 'IPv4' && !address.internal) {
-        urls.push(createAccessUrl(`http://${address.address}:${port}`, token, roomId));
+        urls.push(createAccessUrl(`${protocol}://${address.address}:${port}`, token, roomId));
       }
     }
   }

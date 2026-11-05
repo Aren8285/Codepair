@@ -13,6 +13,7 @@ const clamp = (value: number, min: number, max: number) => Math.min(Math.max(val
 export function CallDock({ manager, open, onOpenChange }: CallDockProps) {
   const snapshot = useSyncExternalStore(manager.subscribe, manager.getSnapshot);
   const [minimized, setMinimized] = useState(false);
+  const [maximized, setMaximized] = useState(false);
   const [position, setPosition] = useState<{ left: number; top: number } | null>(null);
   const dockRef = useRef<HTMLElement>(null);
   const dragRef = useRef<{ pointerId: number; startX: number; startY: number; left: number; top: number; width: number; height: number } | null>(null);
@@ -21,9 +22,23 @@ export function CallDock({ manager, open, onOpenChange }: CallDockProps) {
   useEffect(() => {
     if (!active) {
       setMinimized(false);
+      setMaximized(false);
       setPosition(null);
     }
   }, [active]);
+
+  // A notification toast must never cover the minimized call pill, which sits
+  // in the same bottom-right corner. Raising the toast stack by the pill's
+  // height keeps both reachable.
+  const pillVisible = !open || minimized;
+  useEffect(() => {
+    const root = document.documentElement;
+    if (pillVisible) root.style.setProperty('--toast-offset', '46px');
+    else root.style.removeProperty('--toast-offset');
+    return () => {
+      root.style.removeProperty('--toast-offset');
+    };
+  }, [pillVisible]);
 
   if (!open && !active) return null;
 
@@ -84,6 +99,11 @@ export function CallDock({ manager, open, onOpenChange }: CallDockProps) {
     dragRef.current = null;
   };
 
+  // Give an active screen share the largest slot in the grid so it stays readable.
+  const featuredId: string | null = snapshot.screenSharing
+    ? 'self'
+    : (snapshot.peers.find((peer) => peer.screen)?.id ?? null);
+
   const statusLabel =
     snapshot.status === 'connecting'
       ? 'Connecting…'
@@ -97,7 +117,7 @@ export function CallDock({ manager, open, onOpenChange }: CallDockProps) {
 
   return (
     <aside
-      className="callDock"
+      className={`callDock${maximized ? ' callDock--max' : ''}`}
       ref={dockRef}
       style={position ? { left: position.left, top: position.top, right: 'auto', bottom: 'auto' } : undefined}
       aria-label="Room call"
@@ -123,6 +143,19 @@ export function CallDock({ manager, open, onOpenChange }: CallDockProps) {
           </p>
         </div>
         <div className="callDock__headActions">
+          <button
+            className={`icon-button${maximized ? ' is-on' : ''}`}
+            onClick={() => {
+              setMaximized((value) => !value);
+              // Re-anchor to the docked spot so the enlarged panel stays on screen.
+              setPosition(null);
+            }}
+            aria-pressed={maximized}
+            aria-label={maximized ? 'Restore call panel size' : 'Maximize call panel'}
+            title={maximized ? 'Restore size' : 'Maximize (half screen)'}
+          >
+            <Icon name={maximized ? 'minimize' : 'maximize'} size={15} />
+          </button>
           <button className="icon-button" onClick={() => setMinimized(true)} aria-label="Minimize call" title="Minimize">
             <Icon name="chevron-down" size={15} />
           </button>
@@ -155,7 +188,7 @@ export function CallDock({ manager, open, onOpenChange }: CallDockProps) {
         </div>
       ) : (
         <div className="callDock__body">
-          <div className={`callDock__grid${snapshot.peers.length === 0 ? ' callDock__grid--solo' : ''}`}>
+          <div className={`callDock__grid${snapshot.peers.length === 0 ? ' callDock__grid--solo' : ''}${featuredId ? ' callDock__grid--featured' : ''}`}>
             <VideoTile
               stream={snapshot.previewStream}
               name="You"
@@ -166,6 +199,7 @@ export function CallDock({ manager, open, onOpenChange }: CallDockProps) {
               cam={snapshot.camEnabled}
               screen={snapshot.screenSharing}
               connection="connected"
+              featured={featuredId === 'self'}
             />
             {snapshot.peers.map((peer) => (
               <VideoTile
@@ -177,6 +211,7 @@ export function CallDock({ manager, open, onOpenChange }: CallDockProps) {
                 cam={peer.cam}
                 screen={peer.screen}
                 connection={peer.connection}
+                featured={featuredId === peer.id}
               />
             ))}
           </div>
@@ -233,6 +268,7 @@ function VideoTile({
   cam,
   screen,
   connection,
+  featured = false,
 }: {
   stream: MediaStream | null;
   name: string;
@@ -243,9 +279,12 @@ function VideoTile({
   cam: boolean;
   screen: boolean;
   connection: RTCPeerConnectionState | 'new' | 'connected';
+  featured?: boolean;
 }) {
+  const tileRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const [needsTap, setNeedsTap] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
   const hasVideo = Boolean(stream && stream.getVideoTracks().length > 0);
 
   useEffect(() => {
@@ -260,15 +299,44 @@ function VideoTile({
     };
   }, [stream]);
 
+  useEffect(() => {
+    const onFullscreenChange = () => setIsFullscreen(document.fullscreenElement === tileRef.current);
+    document.addEventListener('fullscreenchange', onFullscreenChange);
+    return () => document.removeEventListener('fullscreenchange', onFullscreenChange);
+  }, []);
+
+  type WebkitFullscreenVideo = HTMLVideoElement & { webkitEnterFullscreen?: () => void };
+
+  const toggleFullscreen = (): void => {
+    const tile = tileRef.current;
+    if (!tile) return;
+    if (document.fullscreenElement) {
+      void document.exitFullscreen().catch(() => undefined);
+      return;
+    }
+    if (tile.requestFullscreen) {
+      void tile.requestFullscreen().catch(() => {
+        // iPhone Safari only allows fullscreen on the video element itself.
+        (videoRef.current as WebkitFullscreenVideo | null)?.webkitEnterFullscreen?.();
+      });
+      return;
+    }
+    // Older WebKit: no element fullscreen API at all.
+    (videoRef.current as WebkitFullscreenVideo | null)?.webkitEnterFullscreen?.();
+  };
+
   return (
-    <div className={`videoTile${stream && hasVideo ? ' videoTile--live' : ''}`}>
+    <div
+      ref={tileRef}
+      className={`videoTile${stream && hasVideo ? ' videoTile--live' : ''}${featured ? ' videoTile--featured' : ''}${isFullscreen ? ' videoTile--fullscreen' : ''}`}
+    >
       {stream ? (
         <video
           ref={videoRef}
           autoPlay
           playsInline
           muted={muted}
-          className={`videoTile__video${self && !screen ? ' videoTile__video--mirror' : ''}`}
+          className={`videoTile__video${self && !screen ? ' videoTile__video--mirror' : ''}${screen || featured ? ' videoTile__video--screen' : ''}`}
         />
       ) : null}
       {!stream || !hasVideo ? (
@@ -287,6 +355,16 @@ function VideoTile({
           }}
         >
           Tap to hear
+        </button>
+      ) : null}
+      {stream && hasVideo ? (
+        <button
+          className="videoTile__fs"
+          onClick={toggleFullscreen}
+          aria-label={isFullscreen ? 'Exit fullscreen' : 'Fullscreen this video'}
+          title={isFullscreen ? 'Exit fullscreen' : 'Fullscreen'}
+        >
+          <Icon name={isFullscreen ? 'collapse' : 'expand'} size={12} />
         </button>
       ) : null}
       <span className="videoTile__name" style={{ borderColor: `${color}88` }}>

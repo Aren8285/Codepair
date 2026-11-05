@@ -155,6 +155,26 @@ const PATHS = {
       <path d="M3 10h18M9 4v16" />
     </>
   ),
+  maximize: (
+    <>
+      <path d="M4 9V5a1 1 0 0 1 1-1h4M15 4h4a1 1 0 0 1 1 1v4M20 15v4a1 1 0 0 1-1 1h-4M9 20H5a1 1 0 0 1-1-1v-4" />
+    </>
+  ),
+  minimize: (
+    <>
+      <path d="M9 4v4a1 1 0 0 1-1 1H4M20 9h-4a1 1 0 0 1-1-1V4M15 20v-4a1 1 0 0 1 1-1h4M4 15h4a1 1 0 0 1 1 1v4" />
+    </>
+  ),
+  expand: (
+    <>
+      <path d="M4 9V4h5M20 15v5h-5M15 4h5v5M9 20H4v-5" />
+    </>
+  ),
+  collapse: (
+    <>
+      <path d="M9 4v5H4M15 20v-5H20M20 9h-5V4M4 15h5v5" />
+    </>
+  ),
 } as const;
 
 export type IconName = keyof typeof PATHS;

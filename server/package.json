@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "tsx watch src/index.ts --dev-client http://localhost:5180",
+    "dev": "tsx watch src/index.ts --root .. --host 0.0.0.0 --dev-client https://localhost:5180",
     "build": "tsup src/index.ts --format esm --target node20 --out-dir dist --sourcemap --clean",
     "start": "node dist/index.js",
     "test": "vitest run",

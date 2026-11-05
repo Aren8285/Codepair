@@ -30,6 +30,9 @@ Host machine                                    Remote clients
   converge, coloured remote cursors, presence avatars, external file changes are merged.
 - **Calls** — microphone, camera and screen share over a peer-to-peer WebRTC mesh with
   signalling relayed by the Host; media is only requested when you press the button.
+  The panel minimizes to a pill or maximizes (capped at half the screen), an active
+  screen share always gets a full-width featured tile, and every participant's video or
+  screen can be sent fullscreen from a button on the tile itself.
 - **Sandboxed paths** — every client-supplied path passes lexical *and* realpath
   containment checks; sensitive names (`.git`, `node_modules`, `.env*`, keys) are hidden.
 - **Token auth everywhere** — a random 256-bit token per start, checked on every HTTP
@@ -150,15 +153,21 @@ page cannot read, and JSON bodies require a CORS preflight.
 
 ## Known issues
 
-- **Camera/mic fail when joining over plain HTTP on a LAN** — browsers expose
-  `navigator.mediaDevices` only in *secure contexts* (HTTPS or `localhost`). Joining from
-  a phone via `http://<lan-ip>:5180` therefore throws
-  `Cannot read properties of undefined (reading 'getUserMedia')` and the toast reads
-  "Camera unavailable"; the join also fails and the panel shows **Call failed**. The same
-  root cause makes the **screen-share button appear dead** (its guarded fallback toast can
-  be missed), and phones additionally do not support `getDisplayMedia` at all.
-  *Workarounds:* use `--tunnel cloudflare`/`--tunnel ngrok` (HTTPS link) for calls from
-  other devices, or test calls from the Host itself in `localhost`.
+- **Concurrent typing at the same spot can briefly interleave** — when two people type
+  the same line region at once, CRDT ordering may briefly place their characters in a
+  different order (it can look like content shifted by a line while one side is still
+  catching up). Both views settle as soon as both clients sync, and no content is
+  duplicated or lost: two-client stress tests (same-region typing bursts, mid-typing
+  disconnects, reconnects during the other's typing) all converge and persist correctly.
+- **Camera/mic/screen share over LAN** — browsers require a *secure context*
+  (HTTPS or `localhost`) for `getUserMedia` and `getDisplayMedia`. In development
+  mode, Vite now serves HTTPS with a self-signed certificate automatically, so
+  LAN users connecting via `https://<lan-ip>:5180` get full media access. Accept
+  the self-signed certificate warning in your browser on first visit. For
+  production builds, put the daemon behind an HTTPS reverse proxy or use
+  `--tunnel cloudflare`/`--tunnel ngrok` for automatic HTTPS.
+  Set `CODE_PAIR_NO_SSL=1` to disable the self-signed cert if you only use
+  localhost.
 - **Calls between different networks fail without TURN** — the default ICE config is
   Google STUN only. Supply TURN via `--ice-servers` for reliable cross-NAT calls:
 

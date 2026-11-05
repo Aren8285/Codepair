@@ -1550,6 +1550,12 @@ kbd {
   overflow: hidden;
 }
 
+/* An active screen share gets the full row so the content stays readable. */
+.videoTile--featured {
+  grid-column: 1 / -1;
+  aspect-ratio: 16 / 9;
+}
+
 .videoTile__video {
   width: 100%;
   height: 100%;
@@ -1559,6 +1565,61 @@ kbd {
 
 .videoTile__video--mirror {
   transform: scaleX(-1);
+}
+
+/* Screen content must never be cropped; letterbox it instead. */
+.videoTile__video--screen {
+  object-fit: contain;
+}
+
+.videoTile:fullscreen {
+  aspect-ratio: auto;
+  border: none;
+  border-radius: 0;
+  background: #000;
+}
+
+.videoTile:fullscreen .videoTile__video {
+  object-fit: contain;
+  height: 100%;
+}
+
+/* Maximized call dock: at most half of the screen in each dimension. */
+.callDock--max {
+  width: min(50vw, 760px);
+  max-height: min(52vh, 620px);
+  overflow: auto;
+}
+
+.callDock__fsToggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.callDock__headActions .icon-button.is-on {
+  color: var(--accent-strong);
+}
+
+.videoTile__fs {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 5px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(5, 10, 16, 0.72);
+  color: #e6edf7;
+  opacity: 0.85;
+}
+
+.videoTile__fs:hover {
+  opacity: 1;
+  border-color: rgba(255, 255, 255, 0.3);
 }
 
 .videoTile__placeholder {
@@ -1613,7 +1674,9 @@ kbd {
 
 .videoTile__unmute {
   position: absolute;
-  inset: auto 8px 8px auto;
+  left: 50%;
+  bottom: 8px;
+  transform: translateX(-50%);
   padding: 4px 8px;
   border-radius: 6px;
   border: 1px solid var(--line-strong);
@@ -2353,6 +2416,13 @@ kbd {
     padding: 0 10px;
   }
 
+  /* The status-bar toggle keeps the 26px bar (growing it pushed the bar off
+     phone-landscape screens), but its touch box overflows the bar evenly. */
+  .statusbar__terminal {
+    height: 40px;
+    margin: -7px 0;
+  }
+
   .toast__close {
     width: 32px;
     height: 32px;
@@ -2771,6 +2841,14 @@ kbd {
     bottom: calc(36px + env(safe-area-inset-bottom, 0px));
     max-height: min(60vh, 430px);
     overflow: auto;
+  }
+
+  .callDock--max {
+    max-height: 72vh;
+  }
+
+  .callDock--max .videoTile--featured {
+    aspect-ratio: 16 / 11;
   }
 
   .callDock__grid {

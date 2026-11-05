@@ -102,6 +102,13 @@ export class CallManager {
     this.attempts = 0;
 
     try {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new DOMException(
+          'Your browser blocked camera/microphone access because this page was loaded over plain HTTP. ' +
+          'Use the HTTPS link printed by the server, or open via localhost.',
+          'NotAllowedError',
+        );
+      }
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: withVideo });
       this.localStream = stream;
       this.audioTrack = stream.getAudioTracks()[0] ?? null;
@@ -162,9 +169,13 @@ export class CallManager {
   }
 
   async startScreenShare(): Promise<void> {
-    if (this.snapshot.screenSharing || this.snapshot.status !== 'active') return;
+    if (this.snapshot.screenSharing) return;
+    if (this.snapshot.status !== 'active') {
+      this.options.onToast?.('warning', 'Join the call first', 'Screen sharing needs an active call connection.');
+      return;
+    }
     if (!navigator.mediaDevices?.getDisplayMedia) {
-      this.options.onToast?.('warning', 'Screen sharing is unavailable', 'This browser does not support display capture.');
+      this.options.onToast?.('warning', 'Screen sharing is unavailable', 'This browser or device does not support display capture (most phones do not).');
       return;
     }
     try {
@@ -426,6 +437,10 @@ export class CallManager {
   }
 
   private async acquireCamera(): Promise<void> {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      this.options.onToast?.('error', 'Camera unavailable', 'Secure context (HTTPS) is required for camera access on this network.');
+      return;
+    }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ video: true });
       const track = stream.getVideoTracks()[0];
@@ -443,6 +458,10 @@ export class CallManager {
   }
 
   private async acquireAudio(): Promise<void> {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      this.options.onToast?.('error', 'Microphone unavailable', 'Secure context (HTTPS) is required for microphone access on this network.');
+      return;
+    }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const track = stream.getAudioTracks()[0];
