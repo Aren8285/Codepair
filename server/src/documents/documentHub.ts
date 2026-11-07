@@ -40,7 +40,7 @@ class DocConnection {
 
   constructor(
     readonly socket: WebSocket,
-    readonly readOnly: boolean,
+    readonly canWrite: boolean,
   ) {}
 }
 
@@ -78,7 +78,7 @@ export class DocumentHub {
   }
 
   /** Attach an upgraded socket to an already prepared document. */
-  connect(relativePath: string, socket: WebSocket, readOnly: boolean): void {
+  connect(relativePath: string, socket: WebSocket, canWrite: boolean): void {
     if (this.disposed) {
       socket.close(1001, 'Server is shutting down.');
       return;
@@ -88,7 +88,7 @@ export class DocumentHub {
       socket.close(4404, 'Could not open file.');
       return;
     }
-    session.attach(socket, readOnly);
+    session.attach(socket, canWrite);
   }
 
   async dispose(): Promise<void> {
@@ -298,13 +298,13 @@ export class DocSession {
     for (const connection of this.connections) this.sendMeta(connection.socket, meta);
   }
 
-  attach(socket: WebSocket, readOnly: boolean): void {
+  attach(socket: WebSocket, canWrite: boolean): void {
     if (this.disposed) {
       socket.close(1001, 'Document closed.');
       return;
     }
     this.cancelIdleClose();
-    const connection = new DocConnection(socket, readOnly);
+    const connection = new DocConnection(socket, canWrite);
     this.connections.add(connection);
     this.startDiskPoll();
 
@@ -328,7 +328,7 @@ export class DocSession {
 
     this.sendMeta(socket, {
       type: 'ready',
-      mode: readOnly ? 'read-only' : 'read-write',
+      mode: canWrite ? 'read-write' : 'read-only',
       savedAt: this.lastSavedAt,
     });
 
@@ -487,12 +487,23 @@ export class DocSession {
         return;
       }
       if (syncType === syncProtocol.messageYjsSyncStep2) {
-        if (connection.readOnly) return;
+        if (!connection.canWrite) {
+          // A client that connected with a diverged document ships its edits in
+          // the step 2 answer, not as a live update. Drop them and say so; stay
+          // silent for an empty diff so a plain read-only open is not noisy.
+          if (syncStepCarriesChanges(decoder)) {
+            this.sendMeta(connection.socket, {
+              type: 'denied',
+              reason: 'This session is read-only; edits are not applied.',
+            });
+          }
+          return;
+        }
         syncProtocol.readSyncStep2(decoder, this.doc, connection);
         return;
       }
       if (syncType === syncProtocol.messageYjsUpdate) {
-        if (connection.readOnly) {
+        if (!connection.canWrite) {
           this.sendMeta(connection.socket, {
             type: 'denied',
             reason: 'This session is read-only; edits are not applied.',
@@ -515,7 +526,7 @@ export class DocSession {
         const text = new TextDecoder().decode(raw);
         if (text.length > 2048) return;
         const payload = JSON.parse(text) as { type?: unknown };
-        if (payload?.type === 'flush' && !connection.readOnly) {
+        if (payload?.type === 'flush' && connection.canWrite) {
           void this.flush()
             .then(() => {
               this.lastSavedAt = Date.now();
@@ -581,6 +592,16 @@ export class DocSession {
   private send(socket: WebSocket, message: Uint8Array): void {
     if (socket.readyState === WS_OPEN) socket.send(message);
   }
+}
+
+/**
+ * Does a sync step 2 payload carry any operation the server does not have yet?
+ * A client that is already in sync sends an empty diff (no structs, no deletes).
+ * Malformed payloads throw, which the caller turns into a 4400 close as before.
+ */
+function syncStepCarriesChanges(decoder: decoding.Decoder): boolean {
+  const update = Y.decodeUpdate(decoding.readVarUint8Array(decoder));
+  return update.structs.length > 0 || update.ds.clients.size > 0;
 }
 
 function toUint8Array(data: unknown): Uint8Array {

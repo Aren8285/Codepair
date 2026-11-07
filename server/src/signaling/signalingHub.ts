@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { WebSocket } from 'ws';
+import { can, type Principal } from '../security/principal.js';
 
 const WS_OPEN = 1;
 const JOIN_DEADLINE_MS = 10_000;
@@ -78,7 +79,7 @@ export class SignalingHub {
     return this.peers.size;
   }
 
-  handle(socket: WebSocket): void {
+  handle(socket: WebSocket, principal: Principal): void {
     if (this.disposed) {
       socket.close(1001, 'Server is shutting down.');
       return;
@@ -138,6 +139,10 @@ export class SignalingHub {
       if (!joined) {
         if (message.type !== 'join') {
           socket.close(4402, 'Send a join message first.');
+          return;
+        }
+        if (!can(principal, 'call.join')) {
+          socket.close(4403, 'You are not permitted to join calls.');
           return;
         }
         peer = this.join(socket, message);

@@ -168,8 +168,8 @@ function Workspace({
   roomId: string;
   onLock: () => void;
 }) {
-  const readOnly = session.mode === 'read-only';
-  const terminalAvailable = session.capabilities.terminal;
+  const readOnly = !session.capabilities.includes('fs.write');
+  const terminalAvailable = session.capabilities.includes('term.use');
   const { toasts, push, dismiss } = useToasts();
   const self = useMemo(() => currentPresence(), []);
   const [childrenByDir, setChildrenByDir] = useState<Record<string, FileEntry[] | undefined>>({});

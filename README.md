@@ -70,8 +70,10 @@ query strings, `Referer` headers or access logs.
 | `--root <dir>` | cwd | Directory exposed by this session |
 | `--host <host>` | `127.0.0.1` | `0.0.0.0` for LAN access |
 | `--port <port>` | `7420` | |
-| `--mode <mode>` | `read-write` | `read-only` disables writes **and** the terminal server-side |
-| `--token <token>` | random per start | Fixed tokens must be 16–512 bytes, URL-safe |
+| `--mode <mode>` | `read-write` | `read-only` makes the primary token a viewer: no writes, deletes or terminal |
+| `--token <token>` | random per start | Primary token: **owner**, or **viewer** with `--mode read-only`. 16–512 bytes, URL-safe |
+| `--editor-token <token>` | — | Extra token with editor access (no `session.admin`) |
+| `--viewer-token <token>` | — | Extra token with view-only access |
 | `--no-terminal` | terminal on | Explicit Host opt-out of remote shells |
 | `--tunnel <provider>` | off | `cloudflare` or `ngrok` public tunnel |
 | `--ice-servers <json>` | Google STUN | JSON `RTCIceServer[]`, max 8 entries |
@@ -84,6 +86,25 @@ Environment equivalents: `CODE_PAIR_MODE`, `CODE_PAIR_TOKEN`, `CODE_PAIR_PORT`,
 `CODE_PAIR_TERMINAL=off`, `CODE_PAIR_TUNNEL`, `CODE_PAIR_ICE_SERVERS`,
 `CODE_PAIR_MAX_FILE_BYTES`, `CODE_PAIR_SAVE_DEBOUNCE_MS`, `CODE_PAIR_IGNORE`,
 `CODE_PAIR_CLIENT_DIST`.
+
+## Roles and tokens
+
+Every token maps to exactly one role, and the role decides what that session may do:
+
+| Role | Capabilities | Can do |
+| --- | --- | --- |
+| `owner` | `fs.read`, `fs.write`, `fs.delete`, `term.use`, `call.join`, `session.admin` | everything |
+| `editor` | `fs.read`, `fs.write`, `fs.delete`, `term.use`, `call.join` | edit, delete, terminal, calls |
+| `viewer` | `fs.read`, `call.join` | read files, receive live edits, join calls |
+
+- `--token` keeps its historical meaning: the **owner** in `read-write`, a **viewer** when
+  `--mode read-only` is set.
+- `--editor-token` and `--viewer-token` add roles to the same session. The daemon prints one
+  link per token, labelled with the role it grants.
+- Tokens must be distinct; the daemon refuses to start when two roles share one.
+- `--no-terminal` still wins over every role: no token gets a shell.
+- A viewer's edits are dropped server-side and the UI explains why, but their cursor and
+  presence still reach everyone else.
 
 ## How to use
 
@@ -130,9 +151,10 @@ slides up as an overlay.
 
 ## Security model (read before sharing a link)
 
-1. **Holding the token ≈ permission** to edit the project and, unless `--no-terminal`,
-   to run commands as the Host user. Share tokens out of band; rotate by restarting the
-   daemon (or passing a different `--token`). The client drops the stored token on a 401.
+1. **Holding a token grants that token's role** — `owner` and `editor` may edit and, unless
+   `--no-terminal`, run commands as the Host user; `viewer` may only read. Share tokens out
+   of band; rotate by restarting the daemon (or passing different `--token` values). The
+   client drops the stored token on a 401.
 2. **HTTP auth**: every `/api/*` route except `/api/health` requires
    `Authorization: Bearer <token>`; comparison hashes both sides with SHA-256 and uses
    `timingSafeEqual`.

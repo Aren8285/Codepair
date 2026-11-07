@@ -1,12 +1,44 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
+import { makePrincipal, type Principal, type Role } from './principal.js';
 
-/** Constant-time token comparison; hashing first avoids leaking length. */
-export function tokensMatch(provided: string | undefined | null, expected: string): boolean {
-  if (!provided) return false;
-  const providedHash = createHash('sha256').update(provided).digest();
-  const expectedHash = createHash('sha256').update(expected).digest();
-  return timingSafeEqual(providedHash, expectedHash);
+export interface TokenGrant {
+  readonly token: string;
+  readonly role: Role;
+}
+
+export type HashCompare = (left: Buffer, right: Buffer) => boolean;
+
+/** Resolve a presented token to a fresh Principal, or null when it is not valid. */
+export type Authenticator = (rawToken: string | undefined | null) => Principal | null;
+
+function hashToken(token: string): Buffer {
+  return createHash('sha256').update(token).digest();
+}
+
+/**
+ * Build the token→role lookup once, at startup.
+ *
+ * Each configured token is hashed a single time, so request handling only hashes
+ * the presented value. Every grant is compared on every attempt — including
+ * after a match — so timing reveals neither which token matched nor how many are
+ * configured. Hashing first also equalises buffer lengths, so a short or long
+ * guess cannot make `timingSafeEqual` throw or short-circuit.
+ */
+export function createAuthenticator(
+  grants: readonly TokenGrant[],
+  compare: HashCompare = timingSafeEqual,
+): Authenticator {
+  const entries = grants.map((grant) => ({ hash: hashToken(grant.token), role: grant.role }));
+  return (rawToken) => {
+    if (typeof rawToken !== 'string' || rawToken.length === 0) return null;
+    const presented = hashToken(rawToken);
+    let matched: Role | undefined;
+    for (const entry of entries) {
+      if (compare(presented, entry.hash) && matched === undefined) matched = entry.role;
+    }
+    return matched === undefined ? null : makePrincipal(matched);
+  };
 }
 
 export function tokenFromAuthorizationHeader(header: string | undefined): string | undefined {

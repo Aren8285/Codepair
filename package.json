@@ -1,6 +1,6 @@
 {
   "name": "codepair",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "Hybrid local-host collaborative IDE: real files, real terminal, Yjs editing, WebRTC calls",
   "license": "MIT",

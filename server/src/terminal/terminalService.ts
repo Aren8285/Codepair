@@ -1,14 +1,15 @@
 import * as pty from 'node-pty';
 import type { WebSocket } from 'ws';
 import { PathGuard } from '../security/pathGuard.js';
+import { can, type Principal } from '../security/principal.js';
 import { cleanupShellSetup, createShellSetup, type ShellSetup } from './shellEnv.js';
 
 const MAX_INPUT_CHARS = 64 * 1024;
 const WS_OPEN = 1;
 
 interface TerminalOptions {
+  /** Server-wide feature flag: `--no-terminal` wins over any principal. */
   enabled: boolean;
-  readOnly: boolean;
   logger?: Pick<Console, 'error' | 'warn'>;
 }
 
@@ -38,7 +39,7 @@ export class TerminalService {
     private readonly options: TerminalOptions,
   ) {
     this.logger = options.logger ?? console;
-    if (options.enabled && !options.readOnly) {
+    if (options.enabled) {
       try {
         this.setup = createShellSetup(guard.root);
       } catch (error) {
@@ -47,7 +48,7 @@ export class TerminalService {
     }
   }
 
-  handle(socket: WebSocket): void {
+  handle(socket: WebSocket, principal: Principal): void {
     if (this.disposed) {
       socket.close(1001, 'Server is shutting down.');
       return;
@@ -56,7 +57,10 @@ export class TerminalService {
       socket.close(4403, 'The terminal is disabled on this server.');
       return;
     }
-    if (this.options.readOnly) {
+    // Checked before `pty.spawn` below, so a principal without term.use never
+    // creates a child process.
+    // TODO(iter2): generic permission message
+    if (!can(principal, 'term.use')) {
       socket.close(4403, 'The terminal is disabled in read-only mode.');
       return;
     }

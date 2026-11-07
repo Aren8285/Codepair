@@ -41,14 +41,16 @@ describe('HTTP API', () => {
 
     const ok = await apiJson<{
       mode: string;
+      role: string;
       rootName: string;
       roomId: string;
-      capabilities: { write: boolean };
+      capabilities: string[];
       rtc: { iceServers: unknown[] };
     }>(current, '/api/session');
     expect(ok.status).toBe(200);
     expect(ok.body.mode).toBe('read-write');
-    expect(ok.body.capabilities.write).toBe(true);
+    expect(ok.body.role).toBe('owner');
+    expect(ok.body.capabilities).toContain('fs.write');
     expect(ok.body.rootName).toBe('project');
     expect(ok.body.roomId).toMatch(/^[a-z0-9]{1,8}-[a-z0-9]{1,8}$/);
     expect(ok.body.rtc.iceServers.length).toBeGreaterThan(0);
@@ -177,9 +179,10 @@ describe('HTTP API', () => {
   it('enforces read-only mode on every mutation but keeps reading available', async () => {
     current = await startTestServer({ files: { 'README.md': '# hi\n' }, args: ['--mode', 'read-only'] });
 
-    const session = await apiJson<{ capabilities: { write: boolean; terminal: boolean } }>(current, '/api/session');
-    expect(session.body.capabilities.write).toBe(false);
-    expect(session.body.capabilities.terminal).toBe(false);
+    const session = await apiJson<{ role: string; capabilities: string[] }>(current, '/api/session');
+    expect(session.body.role).toBe('viewer');
+    expect(session.body.capabilities).not.toContain('fs.write');
+    expect(session.body.capabilities).not.toContain('term.use');
 
     const read = await apiJson<{ content: string }>(current, '/api/file?path=README.md');
     expect(read.status).toBe(200);
@@ -205,7 +208,7 @@ describe('HTTP API', () => {
     ] as const) {
       const result = await apiJson<{ error: { code: string } }>(current, route, init);
       expect(result.status).toBe(403);
-      expect(result.body.error.code).toBe('READ_ONLY');
+      expect(result.body.error.code).toBe('FORBIDDEN');
     }
     expect(fs.existsSync(path.join(current.root, 'README.md'))).toBe(true);
   });

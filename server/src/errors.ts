@@ -23,8 +23,9 @@ export function notFound(message = 'Not found.'): AppError {
   return new AppError(404, 'NOT_FOUND', message);
 }
 
-export function readOnlyViolation(action = 'Editing'): AppError {
-  return new AppError(403, 'READ_ONLY', `${action} is disabled because this session is read-only.`);
+export function forbidden(): AppError {
+  // Deliberately generic: it must not reveal which capability or path failed.
+  return new AppError(403, 'FORBIDDEN', 'You do not have permission to perform this action.');
 }
 
 export function toErrorPayload(error: unknown): {

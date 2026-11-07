@@ -5,22 +5,39 @@ import express, { type NextFunction, type Request, type Response } from 'express
 import { WebSocketServer } from 'ws';
 import { ConfigError, type ServerConfig } from './config.js';
 import { DocumentHub } from './documents/documentHub.js';
-import { AppError, badRequest, readOnlyViolation, unauthorized, toErrorPayload } from './errors.js';
+import { AppError, badRequest, forbidden, unauthorized, toErrorPayload } from './errors.js';
 import { DEFAULT_IGNORED, FileService } from './files/fileService.js';
 import { PathGuard, SandboxError } from './security/pathGuard.js';
 import {
   WS_PROTOCOL,
+  createAuthenticator,
   extractHost,
   isOriginAllowed,
   tokenFromAuthorizationHeader,
   tokenFromWebSocketHeader,
-  tokensMatch,
+  type Authenticator,
 } from './security/auth.js';
+import { CAPABILITIES, can, type Capability, type Principal } from './security/principal.js';
 import { SignalingHub } from './signaling/signalingHub.js';
 import { TerminalService } from './terminal/terminalService.js';
 
-const SERVER_VERSION = '0.2.0';
+const SERVER_VERSION = '0.3.0';
 const MAX_WS_PAYLOAD = 2 * 1024 * 1024;
+
+/** Tags a `requireCap` middleware with the capability it enforces (route audit). */
+export const CAPABILITY_GATE: unique symbol = Symbol.for('codepair.capabilityGate');
+
+/** Tags the `/api` authentication middleware (route audit). */
+export const API_AUTHENTICATION: unique symbol = Symbol.for('codepair.apiAuthentication');
+
+declare global {
+  namespace Express {
+    interface Request {
+      /** Set by the `/api` authentication middleware; never stored globally. */
+      principal?: Principal;
+    }
+  }
+}
 
 export interface CodepairServer {
   readonly app: express.Express;
@@ -32,21 +49,30 @@ export interface CodepairServer {
   close(): Promise<void>;
 }
 
-export async function createCodepairServer(config: ServerConfig): Promise<CodepairServer> {
+export interface CreateServerOptions {
+  /**
+   * Test seam only: replaces the token→principal lookup so a gate can be driven
+   * with a principal no role produces. Production always builds the
+   * authenticator from the configured tokens.
+   */
+  authenticate?: Authenticator;
+}
+
+export async function createCodepairServer(
+  config: ServerConfig,
+  options: CreateServerOptions = {},
+): Promise<CodepairServer> {
   const startedAt = Date.now();
   const guard = new PathGuard(config.root);
+  const authenticate = options.authenticate ?? createAuthenticator(config.tokens);
   const ignored = new Set(DEFAULT_IGNORED);
   for (const name of (process.env.CODE_PAIR_IGNORE ?? '').split(',').map((value) => value.trim()).filter(Boolean)) {
     ignored.add(name);
   }
   const files = new FileService(guard, { maxFileBytes: config.maxFileBytes, ignored });
   const documents = new DocumentHub(files, { saveDebounceMs: config.saveDebounceMs });
-  const terminal = new TerminalService(guard, {
-    enabled: config.terminalEnabled,
-    readOnly: config.mode === 'read-only',
-  });
+  const terminal = new TerminalService(guard, { enabled: config.terminalEnabled });
   const signaling = new SignalingHub({ room: config.roomId });
-  const readOnly = config.mode === 'read-only';
 
   const app = express();
   app.disable('x-powered-by');
@@ -58,51 +84,62 @@ export async function createCodepairServer(config: ServerConfig): Promise<Codepa
     response.json({ ok: true, version: SERVER_VERSION });
   });
 
-  app.use('/api', (request, response, next) => {
-    const token = tokenFromAuthorizationHeader(request.headers.authorization);
-    if (!tokensMatch(token, config.token)) {
-      response.setHeader('WWW-Authenticate', 'Bearer');
-      next(unauthorized());
-      return;
-    }
-    next();
-  });
+  // Tagged so the route-audit test can prove every `/api` route still sits
+  // behind authentication.
+  const authenticateApi: ((request: Request, response: Response, next: NextFunction) => void) & {
+    [API_AUTHENTICATION]: true;
+  } = Object.assign(
+    (request: Request, response: Response, next: NextFunction): void => {
+      const principal = authenticate(tokenFromAuthorizationHeader(request.headers.authorization));
+      if (!principal) {
+        response.setHeader('WWW-Authenticate', 'Bearer');
+        next(unauthorized());
+        return;
+      }
+      request.principal = principal;
+      next();
+    },
+    { [API_AUTHENTICATION]: true as const },
+  );
 
-  app.get('/api/session', (_request, response) => {
+  app.use('/api', authenticateApi);
+
+  app.get('/api/session', (request, response) => {
+    const principal = principalOf(request);
     response.setHeader('Cache-Control', 'no-store');
     response.json({
-      mode: config.mode,
+      role: principal.role,
+      // Effective capabilities: the terminal feature flag can only remove
+      // `term.use`, never add a capability.
+      capabilities: CAPABILITIES.filter(
+        (capability) => can(principal, capability) && (capability !== 'term.use' || config.terminalEnabled),
+      ),
+      mode: can(principal, 'fs.write') ? 'read-write' : 'read-only',
       rootName: path.basename(guard.root) || 'project',
       roomId: config.roomId,
       version: SERVER_VERSION,
       startedAt,
-      capabilities: {
-        write: !readOnly,
-        terminal: config.terminalEnabled && !readOnly,
-        upload: false,
-      },
       limits: { maxFileBytes: config.maxFileBytes },
       rtc: { iceServers: config.iceServers },
     });
   });
 
-  app.get('/api/tree', asyncRoute(async (request, response) => {
+  app.get('/api/tree', requireCap('fs.read'), asyncRoute(async (request, response) => {
     const input = queryString(request.query.path, '');
     response.json(await files.tree(input));
   }));
 
-  app.get('/api/file', asyncRoute(async (request, response) => {
+  app.get('/api/file', requireCap('fs.read'), asyncRoute(async (request, response) => {
     const input = requiredQuery(request.query.path);
     response.json(await files.read(input));
   }));
 
-  app.get('/api/search', asyncRoute(async (request, response) => {
+  app.get('/api/search', requireCap('fs.read'), asyncRoute(async (request, response) => {
     const query = typeof request.query.q === 'string' ? request.query.q.slice(0, 200) : '';
     response.json(await files.search(query));
   }));
 
-  app.post('/api/files', asyncRoute(async (request, response) => {
-    requireWrite(request, readOnly);
+  app.post('/api/files', requireCap('fs.write'), asyncRoute(async (request, response) => {
     const body = asRecord(request.body);
     const input = requireString(body.path, 'path');
     const type = body.type;
@@ -112,8 +149,7 @@ export async function createCodepairServer(config: ServerConfig): Promise<Codepa
     response.status(201).json({ entry });
   }));
 
-  app.post('/api/files/rename', asyncRoute(async (request, response) => {
-    requireWrite(request, readOnly);
+  app.post('/api/files/rename', requireCap('fs.write'), asyncRoute(async (request, response) => {
     const body = asRecord(request.body);
     const from = requireString(body.from, 'from');
     const to = requireString(body.to, 'to');
@@ -123,8 +159,7 @@ export async function createCodepairServer(config: ServerConfig): Promise<Codepa
     response.json({ entry });
   }));
 
-  app.delete('/api/files', asyncRoute(async (request, response) => {
-    requireWrite(request, readOnly);
+  app.delete('/api/files', requireCap('fs.delete'), asyncRoute(async (request, response) => {
     const input = typeof request.query.path === 'string' ? request.query.path : undefined;
     if (!input) throw badRequest('path query parameter is required.');
     documents.discardSubtree(input, 'This file was deleted.');
@@ -219,8 +254,8 @@ export async function createCodepairServer(config: ServerConfig): Promise<Codepa
       return;
     }
 
-    const token = tokenFromWebSocketHeader(request.headers['sec-websocket-protocol']);
-    if (!tokensMatch(token, config.token)) {
+    const principal = authenticate(tokenFromWebSocketHeader(request.headers['sec-websocket-protocol']));
+    if (!principal) {
       rejectUpgrade(socket, 401, 'Unauthorized', 'A valid access token is required.');
       return;
     }
@@ -233,6 +268,10 @@ export async function createCodepairServer(config: ServerConfig): Promise<Codepa
       const docPath = url.searchParams.get('path');
       if (!docPath) {
         rejectUpgrade(socket, 400, 'Bad Request', 'Missing path.');
+        return;
+      }
+      if (!can(principal, 'fs.read')) {
+        rejectUpgrade(socket, 403, 'Forbidden', 'You do not have permission to open files.');
         return;
       }
       try {
@@ -255,7 +294,7 @@ export async function createCodepairServer(config: ServerConfig): Promise<Codepa
         if (socket.destroyed) return;
         docWss.handleUpgrade(request, socket, head, (webSocket) => {
           docWss.emit('connection', webSocket, request);
-          documents.connect(docPath, webSocket, readOnly);
+          documents.connect(docPath, webSocket, can(principal, 'fs.write'));
         });
       })();
       return;
@@ -264,7 +303,7 @@ export async function createCodepairServer(config: ServerConfig): Promise<Codepa
     if (url.pathname === '/ws/terminal') {
       terminalWss.handleUpgrade(request, socket, head, (webSocket) => {
         terminalWss.emit('connection', webSocket, request);
-        terminal.handle(webSocket);
+        terminal.handle(webSocket, principal);
       });
       return;
     }
@@ -276,7 +315,7 @@ export async function createCodepairServer(config: ServerConfig): Promise<Codepa
       }
       signalWss.handleUpgrade(request, socket, head, (webSocket) => {
         signalWss.emit('connection', webSocket, request);
-        signaling.handle(webSocket);
+        signaling.handle(webSocket, principal);
       });
       return;
     }
@@ -383,8 +422,31 @@ function asyncRoute(handler: (request: Request, response: Response) => Promise<v
   };
 }
 
-function requireWrite(request: Request, readOnly: boolean): void {
-  if (readOnly) throw readOnlyViolation(request.method === 'DELETE' ? 'Deleting' : 'Editing');
+/**
+ * Capability gate for HTTP routes. A missing or insufficient capability is
+ * denied with a generic 403 that names neither the capability nor the path.
+ */
+export type CapabilityGate = ((request: Request, _response: Response, next: NextFunction) => void) & {
+  [CAPABILITY_GATE]: Capability;
+};
+
+export function requireCap(capability: Capability): CapabilityGate {
+  return Object.assign(
+    (request: Request, _response: Response, next: NextFunction): void => {
+      if (!can(request.principal, capability)) {
+        next(forbidden());
+        return;
+      }
+      next();
+    },
+    { [CAPABILITY_GATE]: capability },
+  );
+}
+
+/** The `/api` middleware always sets a principal; this only narrows the type. */
+function principalOf(request: Request): Principal {
+  if (!request.principal) throw unauthorized();
+  return request.principal;
 }
 
 function asRecord(value: unknown): Record<string, unknown> {

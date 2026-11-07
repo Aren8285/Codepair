@@ -12,7 +12,10 @@ Options:
   --host <host>             Bind address (default: 127.0.0.1, use 0.0.0.0 for LAN)
   --port <port>             Port (default: 7420)
   --mode <mode>             "read-write" (default) or "read-only"
-  --token <token>           Fixed access token (default: random per start)
+  --token <token>           Primary token: owner access, or viewer with --mode read-only
+                            (default: random per start)
+  --editor-token <token>    Extra token with editor access (not read-only)
+  --viewer-token <token>    Extra token with view-only access
   --allow-origin <origin>   Extra WebSocket origin allowed (repeatable)
   --no-terminal             Disable the remote terminal (explicit opt-out)
   --tunnel <provider>       "cloudflare" or "ngrok" public tunnel
@@ -41,7 +44,7 @@ async function main(): Promise<void> {
     return;
   }
   if (argv.includes('--version')) {
-    process.stdout.write('0.2.0\n');
+    process.stdout.write('0.3.0\n');
     return;
   }
 
@@ -64,33 +67,38 @@ async function main(): Promise<void> {
     }
   }
 
-  const accessUrl = createAccessUrl(tunnel?.publicUrl ?? localBase, config.token, config.roomId);
-
   if (!config.quiet) {
     const lines: string[] = [];
     lines.push('');
-    lines.push('  \u001b[38;5;39mCodePair\u001b[0m  \u001b[38;5;242mv0.2.0\u001b[0m');
+    lines.push('  \u001b[38;5;39mCodePair\u001b[0m  \u001b[38;5;242mv0.3.0\u001b[0m');
     lines.push('');
     lines.push(`  Project   ${server.guard.root}`);
     lines.push(`  Room      ${config.roomId}`);
-    lines.push(`  Mode      ${config.mode}`);
+    lines.push(`  Mode      ${config.tokens[0]?.role === 'viewer' ? 'read-only' : 'read-write'}`);
     lines.push(
       `  Terminal  ${
-        config.terminalEnabled && config.mode !== 'read-only'
-          ? '\u001b[33menabled\u001b[0m — remote clients get a real shell as ' + (process.env.USER ?? 'you')
-          : 'disabled' + (config.mode === 'read-only' ? ' (read-only session)' : ' (--no-terminal)')
+        config.terminalEnabled
+          ? '\u001b[33menabled\u001b[0m — remote clients with terminal access get a real shell as ' +
+            (process.env.USER ?? 'you')
+          : 'disabled (--no-terminal)'
       }`,
     );
     lines.push('');
-    lines.push(`  Open      \u001b[4m${accessUrl}\u001b[0m`);
-    if (config.tokenWasGenerated) {
-      lines.push(`  Token     ${config.token}`);
+    // One access URL per token, labelled by the role it grants. A raw token is
+    // never printed outside the URL fragment (and only a generated one at all).
+    for (const grant of config.tokens) {
+      const url = createAccessUrl(tunnel?.publicUrl ?? localBase, grant.token, config.roomId);
+      lines.push(`  Open      \u001b[4m${url}\u001b[0m  \u001b[38;5;242m(${grant.role})\u001b[0m`);
     }
     lines.push('');
     if (config.host === '0.0.0.0' || config.host === '::') {
       const lanPort = config.devClientUrl ? new URL(config.devClientUrl).port || port : port;
       const lanProtocol = config.devClientUrl?.startsWith('https') ? 'https' : 'http';
-      for (const url of networkUrls(config.token, Number(lanPort), config.roomId, lanProtocol)) lines.push(`  Network   ${url}`);
+      for (const grant of config.tokens) {
+        for (const url of networkUrls(grant.token, Number(lanPort), config.roomId, lanProtocol)) {
+          lines.push(`  Network   ${url}  \u001b[38;5;242m(${grant.role})\u001b[0m`);
+        }
+      }
       lines.push('');
       lines.push('  \u001b[33mAnyone on this network with the link has the access you granted.\u001b[0m');
       lines.push('  \u001b[33mUse read-only mode for demos; prefer a VPN or trusted LAN.\u001b[0m');
@@ -99,7 +107,10 @@ async function main(): Promise<void> {
     }
     if (tunnel) {
       lines.push('');
-      lines.push(`  Public    \u001b[4m${createAccessUrl(tunnel.publicUrl, config.token, config.roomId)}\u001b[0m`);
+      for (const grant of config.tokens) {
+        const url = createAccessUrl(tunnel.publicUrl, grant.token, config.roomId);
+        lines.push(`  Public    \u001b[4m${url}\u001b[0m  \u001b[38;5;242m(${grant.role})\u001b[0m`);
+      }
       lines.push('  \u001b[33mThe tunnel URL is temporary; it disappears when this process stops.\u001b[0m');
     }
     lines.push('');

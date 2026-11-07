@@ -1,6 +1,8 @@
 import { randomBytes } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import type { TokenGrant } from './security/auth.js';
+import type { Role } from './security/principal.js';
 
 export type AccessMode = 'read-only' | 'read-write';
 export type TunnelProvider = 'cloudflare' | 'ngrok';
@@ -16,9 +18,10 @@ export interface ServerConfig {
   root: string;
   host: string;
   port: number;
-  mode: AccessMode;
-  /** Random per-process access token. */
+  /** Primary token: `--token`, or the generated owner token. */
   token: string;
+  /** Every token this session accepts, each mapped to one role. */
+  tokens: TokenGrant[];
   tokenWasGenerated: boolean;
   /** Stable room identifier for this session (signalling + share links). */
   roomId: string;
@@ -76,16 +79,23 @@ export function parseConfig(
   const host = flagValue(flags, 'host') ?? env.CODE_PAIR_HOST ?? '127.0.0.1';
   if (!host.trim()) throw new ConfigError('Host must not be empty.');
 
+  // `--token` keeps its historical meaning: full access in read-write mode and a
+  // read-only viewer in `--mode read-only`. Extra roles are opt-in.
+  const primaryRole: Role = mode === 'read-only' ? 'viewer' : 'owner';
   const envToken = flagValue(flags, 'token') ?? env.CODE_PAIR_TOKEN;
-  if (envToken !== undefined && (envToken.length < 16 || Buffer.byteLength(envToken) > MAX_TOKEN_BYTES)) {
-    throw new ConfigError('Access token must be between 16 and 512 bytes.');
-  }
   const token = envToken ?? generateToken();
-  if (!/^[A-Za-z0-9._~-]+$/.test(token)) {
-    throw new ConfigError(
-      'Access token may only contain letters, digits, dot, underscore, tilde or hyphen (it is sent as a WebSocket subprotocol).',
-    );
+  assertToken(token);
+
+  const tokens: TokenGrant[] = [{ token, role: primaryRole }];
+  for (const [role, value] of [
+    ['editor', flagValue(flags, 'editor-token')],
+    ['viewer', flagValue(flags, 'viewer-token')],
+  ] as const) {
+    if (value === undefined) continue;
+    assertToken(value);
+    tokens.push({ token: value, role });
   }
+  assertDistinctTokens(tokens);
 
   const devClientUrl = flagValue(flags, 'dev-client') ?? env.CODE_PAIR_DEV_CLIENT;
   if (devClientUrl) assertOrigin(devClientUrl, 'dev client URL');
@@ -108,8 +118,8 @@ export function parseConfig(
     root,
     host,
     port,
-    mode,
     token,
+    tokens,
     tokenWasGenerated: envToken === undefined,
     roomId: generateRoomId(),
     devClientUrl: devClientUrl ? devClientUrl.replace(/\/$/, '') : undefined,
@@ -212,6 +222,29 @@ function parseIceServers(raw: string | undefined): IceServerConfig[] {
     }
     return server;
   });
+}
+
+function assertToken(token: string): void {
+  if (token.length < 16 || Buffer.byteLength(token) > MAX_TOKEN_BYTES) {
+    throw new ConfigError('Access token must be between 16 and 512 bytes.');
+  }
+  if (!/^[A-Za-z0-9._~-]+$/.test(token)) {
+    throw new ConfigError(
+      'Access token may only contain letters, digits, dot, underscore, tilde or hyphen (it is sent as a WebSocket subprotocol).',
+    );
+  }
+}
+
+/** Two roles sharing a token would silently collapse into one access level. */
+function assertDistinctTokens(tokens: TokenGrant[]): void {
+  const seen = new Map<string, Role>();
+  for (const grant of tokens) {
+    const existing = seen.get(grant.token);
+    if (existing !== undefined) {
+      throw new ConfigError(`Access tokens must be distinct: the ${existing} and ${grant.role} tokens are identical.`);
+    }
+    seen.set(grant.token, grant.role);
+  }
 }
 
 export function normalizeMode(value: string | undefined): AccessMode {

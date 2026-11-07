@@ -1,5 +1,9 @@
 export type AccessMode = 'read-only' | 'read-write';
 
+export type Role = 'owner' | 'editor' | 'viewer';
+
+export type Capability = 'fs.read' | 'fs.write' | 'fs.delete' | 'term.use' | 'call.join' | 'session.admin';
+
 export interface IceServer {
   urls: string | string[];
   username?: string;
@@ -7,12 +11,15 @@ export interface IceServer {
 }
 
 export interface SessionInfo {
+  /** Derived server-side from the principal; kept for display labels. */
   mode: AccessMode;
+  role: Role;
+  /** Effective capabilities: the terminal feature flag can remove `term.use`. */
+  capabilities: Capability[];
   rootName: string;
   roomId: string;
   version: string;
   startedAt: number;
-  capabilities: { write: boolean; terminal: boolean; upload: boolean };
   limits: { maxFileBytes: number };
   rtc: { iceServers: IceServer[] };
 }
@@ -142,8 +149,8 @@ export function describeApiError(error: unknown): string {
       case 'PATH_ESCAPE':
       case 'INVALID_PATH':
         return 'Blocked: that path is outside the shared project.';
-      case 'READ_ONLY':
-        return 'This session is read-only.';
+      case 'FORBIDDEN':
+        return 'You do not have permission to do that in this session.';
       case 'PROTECTED_PATH':
         return error.message;
       case 'FILE_TOO_LARGE':
