@@ -33,6 +33,8 @@ export class TerminalService {
   private readonly setup: ShellSetup | undefined;
   private readonly logger: Pick<Console, 'error' | 'warn'>;
   private disposed = false;
+  private closeCode = 1001;
+  private closeReason = 'Server is shutting down.';
 
   constructor(
     private readonly guard: PathGuard,
@@ -50,7 +52,9 @@ export class TerminalService {
 
   handle(socket: WebSocket, principal: Principal): void {
     if (this.disposed) {
-      socket.close(1001, 'Server is shutting down.');
+      // Checked first: a socket that resolved this session before a root swap
+      // never spawns a shell in a session that is being torn down.
+      socket.close(this.closeCode, this.closeReason);
       return;
     }
     if (!this.options.enabled) {
@@ -143,7 +147,18 @@ export class TerminalService {
     });
   }
 
-  dispose(): void {
+  get activeSessions(): number {
+    return this.sessions.size;
+  }
+
+  /** Directory holding the generated rc files; removed by `dispose`. */
+  get shellSetupDir(): string | undefined {
+    return this.setup?.rcDir;
+  }
+
+  dispose(options: { closeCode?: number; reason?: string } = {}): void {
+    this.closeCode = options.closeCode ?? 1001;
+    this.closeReason = options.reason ?? 'Server is shutting down.';
     this.disposed = true;
     for (const session of [...this.sessions]) {
       session.closed = true;
@@ -153,7 +168,7 @@ export class TerminalService {
         // Already exited.
       }
       try {
-        session.socket.close(1001, 'Server is shutting down.');
+        session.socket.close(this.closeCode, this.closeReason);
       } catch {
         session.socket.terminate();
       }

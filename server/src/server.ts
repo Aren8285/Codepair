@@ -3,11 +3,10 @@ import http from 'node:http';
 import path from 'node:path';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import { WebSocketServer } from 'ws';
-import { ConfigError, type ServerConfig } from './config.js';
-import { DocumentHub } from './documents/documentHub.js';
-import { AppError, badRequest, forbidden, unauthorized, toErrorPayload } from './errors.js';
-import { DEFAULT_IGNORED, FileService } from './files/fileService.js';
-import { PathGuard, SandboxError } from './security/pathGuard.js';
+import { createAdminApp } from './admin/adminApp.js';
+import { ConfigError, generateToken, type ServerConfig } from './config.js';
+import { AppError, badRequest, unauthorized, toErrorPayload } from './errors.js';
+import { DEFAULT_IGNORED } from './files/fileService.js';
 import {
   WS_PROTOCOL,
   createAuthenticator,
@@ -17,42 +16,47 @@ import {
   tokenFromWebSocketHeader,
   type Authenticator,
 } from './security/auth.js';
-import { CAPABILITIES, can, type Capability, type Principal } from './security/principal.js';
+import { CAPABILITY_GATE, requireCap } from './security/gate.js';
+import { securityHeaders } from './security/headers.js';
+import { CAPABILITIES, can, type Principal } from './security/principal.js';
+import { SandboxError, type PathGuard } from './security/pathGuard.js';
+import type { Session } from './session/session.js';
+import { SessionManager } from './session/sessionManager.js';
 import { SignalingHub } from './signaling/signalingHub.js';
-import { TerminalService } from './terminal/terminalService.js';
 
-const SERVER_VERSION = '0.3.0';
+export { CAPABILITY_GATE, requireCap };
+export type { CapabilityGate } from './security/gate.js';
+
+const SERVER_VERSION = '0.3.1';
 const MAX_WS_PAYLOAD = 2 * 1024 * 1024;
-
-/** Tags a `requireCap` middleware with the capability it enforces (route audit). */
-export const CAPABILITY_GATE: unique symbol = Symbol.for('codepair.capabilityGate');
 
 /** Tags the `/api` authentication middleware (route audit). */
 export const API_AUTHENTICATION: unique symbol = Symbol.for('codepair.apiAuthentication');
 
-declare global {
-  namespace Express {
-    interface Request {
-      /** Set by the `/api` authentication middleware; never stored globally. */
-      principal?: Principal;
-    }
-  }
-}
-
 export interface CodepairServer {
   readonly app: express.Express;
   readonly httpServer: http.Server;
+  /** Path guard of the active session (convenience for the banner and tests). */
   readonly guard: PathGuard;
+  readonly root: string;
   readonly config: ServerConfig;
   readonly startedAt: number;
-  start(port?: number, host?: string): Promise<{ port: number; host: string }>;
+  readonly sessions: SessionManager;
+  /** Loopback-only Host console listener. */
+  readonly admin: {
+    readonly token: string;
+    readonly port: number;
+    readonly app: express.Express;
+    readonly httpServer: http.Server;
+  };
+  start(port?: number, host?: string): Promise<{ port: number; host: string; adminPort: number }>;
   close(): Promise<void>;
 }
 
 export interface CreateServerOptions {
   /**
-   * Test seam only: replaces the token→principal lookup so a gate can be driven
-   * with a principal no role produces. Production always builds the
+   * Test seam only: replaces the guest token→principal lookup so a gate can be
+   * driven with a principal no role produces. Production always builds the
    * authenticator from the configured tokens.
    */
   authenticate?: Authenticator;
@@ -63,16 +67,39 @@ export async function createCodepairServer(
   options: CreateServerOptions = {},
 ): Promise<CodepairServer> {
   const startedAt = Date.now();
-  const guard = new PathGuard(config.root);
-  const authenticate = options.authenticate ?? createAuthenticator(config.tokens);
+
   const ignored = new Set(DEFAULT_IGNORED);
   for (const name of (process.env.CODE_PAIR_IGNORE ?? '').split(',').map((value) => value.trim()).filter(Boolean)) {
     ignored.add(name);
   }
-  const files = new FileService(guard, { maxFileBytes: config.maxFileBytes, ignored });
-  const documents = new DocumentHub(files, { saveDebounceMs: config.saveDebounceMs });
-  const terminal = new TerminalService(guard, { enabled: config.terminalEnabled });
+
+  // The one active session. `config.root` is read exactly here and nowhere else
+  // in the server; every request resolves the session it will use, once.
+  const sessions = new SessionManager(config.root, {
+    saveDebounceMs: config.saveDebounceMs,
+    maxFileBytes: config.maxFileBytes,
+    terminalEnabled: config.terminalEnabled,
+    ignored,
+  });
+
+  // Signalling is session-independent: rooms are stable for the daemon's life.
   const signaling = new SignalingHub({ room: config.roomId });
+
+  const authenticate = options.authenticate ?? createAuthenticator(config.tokens);
+
+  // The Host console gets its own authenticator, built from one grant, and that
+  // instance is passed only to the admin app. Guest grants are never registered
+  // on it; admin routes are never mounted on the guest listener, so holding
+  // `session.admin` on the guest port grants nothing there.
+  const adminToken = generateToken();
+  const adminAuthenticator = createAuthenticator([{ token: adminToken, role: 'owner' }]);
+  let adminPort: number | undefined;
+  const adminApp = createAdminApp({
+    sessions,
+    authenticate: adminAuthenticator,
+    port: () => adminPort ?? 0,
+  });
+  const adminHttpServer = http.createServer(adminApp);
 
   const app = express();
   app.disable('x-powered-by');
@@ -106,6 +133,7 @@ export async function createCodepairServer(
 
   app.get('/api/session', (request, response) => {
     const principal = principalOf(request);
+    const session = sessions.current();
     response.setHeader('Cache-Control', 'no-store');
     response.json({
       role: principal.role,
@@ -115,7 +143,7 @@ export async function createCodepairServer(
         (capability) => can(principal, capability) && (capability !== 'term.use' || config.terminalEnabled),
       ),
       mode: can(principal, 'fs.write') ? 'read-write' : 'read-only',
-      rootName: path.basename(guard.root) || 'project',
+      rootName: path.basename(session.root) || 'project',
       roomId: config.roomId,
       version: SERVER_VERSION,
       startedAt,
@@ -125,50 +153,62 @@ export async function createCodepairServer(
   });
 
   app.get('/api/tree', requireCap('fs.read'), asyncRoute(async (request, response) => {
+    const session = sessions.current();
     const input = queryString(request.query.path, '');
-    response.json(await files.tree(input));
+    response.json(await session.files.tree(input));
   }));
 
   app.get('/api/file', requireCap('fs.read'), asyncRoute(async (request, response) => {
+    const session = sessions.current();
     const input = requiredQuery(request.query.path);
-    response.json(await files.read(input));
+    response.json(await session.files.read(input));
   }));
 
   app.get('/api/search', requireCap('fs.read'), asyncRoute(async (request, response) => {
+    const session = sessions.current();
     const query = typeof request.query.q === 'string' ? request.query.q.slice(0, 200) : '';
-    response.json(await files.search(query));
+    response.json(await session.files.search(query));
   }));
 
   app.post('/api/files', requireCap('fs.write'), asyncRoute(async (request, response) => {
+    const session = sessions.current();
     const body = asRecord(request.body);
     const input = requireString(body.path, 'path');
     const type = body.type;
     if (type !== 'file' && type !== 'directory') throw badRequest('type must be "file" or "directory".');
     const content = body.content === undefined ? '' : requireString(body.content, 'content');
-    const entry = await files.create(input, type, content);
+    const entry = await session.files.create(input, type, content);
     response.status(201).json({ entry });
   }));
 
   app.post('/api/files/rename', requireCap('fs.write'), asyncRoute(async (request, response) => {
+    const session = sessions.current();
     const body = asRecord(request.body);
     const from = requireString(body.from, 'from');
     const to = requireString(body.to, 'to');
-    await documents.flushSubtree(from);
-    documents.discardSubtree(from, 'This file was renamed.');
-    const entry = await files.rename(from, to);
+    await session.documents.flushSubtree(from);
+    session.documents.discardSubtree(from, 'This file was renamed.');
+    const entry = await session.files.rename(from, to);
     response.json({ entry });
   }));
 
   app.delete('/api/files', requireCap('fs.delete'), asyncRoute(async (request, response) => {
+    const session = sessions.current();
     const input = typeof request.query.path === 'string' ? request.query.path : undefined;
     if (!input) throw badRequest('path query parameter is required.');
-    documents.discardSubtree(input, 'This file was deleted.');
-    const result = await files.remove(input);
+    session.documents.discardSubtree(input, 'This file was deleted.');
+    const result = await session.files.remove(input);
     response.json(result);
   }));
 
   app.use('/api', (_request, _response, next) => {
     next(new AppError(404, 'NOT_FOUND', 'Unknown API route.'));
+  });
+
+  // The Host console is a separate listener. It is never mounted here, and the
+  // prefix is refused before the static/SPA fallbacks can answer it with a page.
+  app.use('/admin', (_request, _response, next) => {
+    next(new AppError(404, 'NOT_FOUND', 'Not found.'));
   });
 
   const hasClientBuild = fs.existsSync(path.join(config.clientDist, 'index.html'));
@@ -274,18 +314,33 @@ export async function createCodepairServer(
         rejectUpgrade(socket, 403, 'Forbidden', 'You do not have permission to open files.');
         return;
       }
+
+      // One resolution per connection: everything below uses this session,
+      // even if the Host switches root while the file is being read.
+      const session = sessions.current();
       try {
-        guard.resolve(docPath);
+        session.pathGuard.resolve(docPath);
       } catch (error) {
         const message = error instanceof SandboxError ? error.message : 'Invalid path.';
         rejectUpgrade(socket, 403, 'Forbidden', message);
         return;
       }
+
       void (async () => {
         try {
-          await documents.prepare(docPath);
+          await session.documents.prepare(docPath);
         } catch (error) {
           if (socket.destroyed) return;
+          if (session.documents.disposed || !isActiveSession(sessions, session)) {
+            // The session went away mid-prepare. Complete the upgrade only to
+            // close it with that session's code (4410 on a root switch), so the
+            // client stops reconnecting instead of seeing a rejected upgrade.
+            docWss.handleUpgrade(request, socket, head, (webSocket) => {
+              docWss.emit('connection', webSocket, request);
+              session.documents.connect(docPath, webSocket, can(principal, 'fs.write'));
+            });
+            return;
+          }
           const status = error instanceof AppError ? error.status : 404;
           const message = error instanceof Error ? error.message : 'Could not open file.';
           rejectUpgrade(socket, status >= 400 && status < 600 ? status : 500, 'Cannot Open File', message);
@@ -294,16 +349,17 @@ export async function createCodepairServer(
         if (socket.destroyed) return;
         docWss.handleUpgrade(request, socket, head, (webSocket) => {
           docWss.emit('connection', webSocket, request);
-          documents.connect(docPath, webSocket, can(principal, 'fs.write'));
+          session.documents.connect(docPath, webSocket, can(principal, 'fs.write'));
         });
       })();
       return;
     }
 
     if (url.pathname === '/ws/terminal') {
+      const session = sessions.current();
       terminalWss.handleUpgrade(request, socket, head, (webSocket) => {
         terminalWss.emit('connection', webSocket, request);
-        terminal.handle(webSocket, principal);
+        session.terminals.handle(webSocket, principal);
       });
       return;
     }
@@ -336,37 +392,54 @@ export async function createCodepairServer(
   let listening = false;
   let closed = false;
 
+  const admin = {
+    token: adminToken,
+    app: adminApp as express.Express,
+    httpServer: adminHttpServer,
+    get port(): number {
+      return adminPort ?? 0;
+    },
+  };
+
   return {
     app,
     httpServer,
-    guard,
     config,
     startedAt,
+    sessions,
+    admin,
+    get guard(): PathGuard {
+      return sessions.current().pathGuard;
+    },
+    get root(): string {
+      return sessions.current().root;
+    },
     async start(port = config.port, host = config.host) {
       if (listening) throw new ConfigError('Server is already listening.');
-      await new Promise<void>((resolve, reject) => {
-        const onError = (error: Error) => {
-          httpServer.off('listening', onListening);
-          reject(error);
-        };
-        const onListening = () => {
-          httpServer.off('error', onError);
-          resolve();
-        };
-        httpServer.once('error', onError);
-        httpServer.once('listening', onListening);
-        httpServer.listen(port, host);
-      });
+
+      const actualPort = await listen(httpServer, port, host);
+
+      try {
+        // 127.0.0.1 as a literal, never `config.host`: the Host console is
+        // unreachable from the LAN and from a tunnel.
+        adminPort = await listen(adminHttpServer, config.adminPort, '127.0.0.1');
+      } catch (error) {
+        await new Promise<void>((resolve) => {
+          httpServer.close(() => resolve());
+          httpServer.closeAllConnections?.();
+        });
+        const code = (error as NodeJS.ErrnoException | undefined)?.code;
+        const reason = code === 'EADDRINUSE' ? 'is already in use' : `could not be bound (${String(code ?? error)})`;
+        throw new ConfigError(`Admin port ${config.adminPort} ${reason}. Pass --admin-port <n> to choose another port.`);
+      }
+
       listening = true;
-      const address = httpServer.address();
-      const actualPort = typeof address === 'object' && address ? address.port : port;
-      return { port: actualPort, host };
+      return { port: actualPort, host, adminPort: adminPort ?? 0 };
     },
     async close() {
       if (closed) return;
       closed = true;
-      await documents.dispose();
-      terminal.dispose();
+      await sessions.dispose();
       signaling.dispose();
       for (const client of docWss.clients) client.terminate();
       for (const client of terminalWss.clients) client.terminate();
@@ -383,6 +456,10 @@ export async function createCodepairServer(
         });
         listening = false;
       }
+      await new Promise<void>((resolve) => {
+        adminHttpServer.close(() => resolve());
+        adminHttpServer.closeAllConnections?.();
+      });
     },
   };
 }
@@ -416,31 +493,36 @@ function isLocalOrPrivateHost(hostname: string): boolean {
   return false;
 }
 
+/** Is this session still the active one? Never throws during shutdown. */
+function isActiveSession(sessions: SessionManager, session: Session): boolean {
+  try {
+    return sessions.current() === session;
+  } catch {
+    return false;
+  }
+}
+
+function listen(server: http.Server, port: number, host: string): Promise<number> {
+  return new Promise<number>((resolve, reject) => {
+    const onError = (error: Error) => {
+      server.off('listening', onListening);
+      reject(error);
+    };
+    const onListening = () => {
+      server.off('error', onError);
+      const address = server.address();
+      resolve(typeof address === 'object' && address ? address.port : port);
+    };
+    server.once('error', onError);
+    server.once('listening', onListening);
+    server.listen(port, host);
+  });
+}
+
 function asyncRoute(handler: (request: Request, response: Response) => Promise<void>) {
   return (request: Request, response: Response, next: NextFunction) => {
     handler(request, response).catch(next);
   };
-}
-
-/**
- * Capability gate for HTTP routes. A missing or insufficient capability is
- * denied with a generic 403 that names neither the capability nor the path.
- */
-export type CapabilityGate = ((request: Request, _response: Response, next: NextFunction) => void) & {
-  [CAPABILITY_GATE]: Capability;
-};
-
-export function requireCap(capability: Capability): CapabilityGate {
-  return Object.assign(
-    (request: Request, _response: Response, next: NextFunction): void => {
-      if (!can(request.principal, capability)) {
-        next(forbidden());
-        return;
-      }
-      next();
-    },
-    { [CAPABILITY_GATE]: capability },
-  );
 }
 
 /** The `/api` middleware always sets a principal; this only narrows the type. */
@@ -482,34 +564,6 @@ function normalizeBodyParserError(error: unknown): AppError | undefined {
     return new AppError(413, 'PAYLOAD_TOO_LARGE', 'The request body is too large.');
   }
   return undefined;
-}
-
-function securityHeaders(_request: Request, response: Response, next: NextFunction): void {
-  response.setHeader(
-    'Content-Security-Policy',
-    [
-      "default-src 'self'",
-      "script-src 'self'",
-      "style-src 'self' 'unsafe-inline'",
-      "font-src 'self' data:",
-      "img-src 'self' data: blob:",
-      "media-src 'self' blob: mediastream:",
-      "connect-src 'self' ws: wss:",
-      "worker-src 'self' blob:",
-      "object-src 'none'",
-      "base-uri 'none'",
-      "form-action 'self'",
-      "frame-ancestors 'none'",
-    ].join('; '),
-  );
-  response.setHeader('X-Content-Type-Options', 'nosniff');
-  response.setHeader('X-Frame-Options', 'DENY');
-  response.setHeader('Referrer-Policy', 'no-referrer');
-  response.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
-  // WebRTC needs camera/mic/display capture, but only same-origin pages may ask.
-  response.setHeader('Permissions-Policy', 'camera=(self), microphone=(self), display-capture=(self), geolocation=()');
-  if (_request.path.startsWith('/api')) response.setHeader('Cache-Control', 'no-store');
-  next();
 }
 
 function rejectUpgrade(socket: import('node:stream').Duplex, status: number, reason: string, message: string): void {

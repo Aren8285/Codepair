@@ -56,7 +56,10 @@ export class DocumentHub {
   private readonly saveDebounceMs: number;
   private readonly idleCloseMs: number;
   private readonly logger: Pick<Console, 'error' | 'warn'>;
-  private disposed = false;
+  /** Public so a request can tell a live hub from a disposed one. */
+  disposed = false;
+  private closeCode = 1001;
+  private closeReason = 'Server is shutting down.';
 
   constructor(
     private readonly files: FileService,
@@ -80,7 +83,9 @@ export class DocumentHub {
   /** Attach an upgraded socket to an already prepared document. */
   connect(relativePath: string, socket: WebSocket, canWrite: boolean): void {
     if (this.disposed) {
-      socket.close(1001, 'Server is shutting down.');
+      // A connection that resolved this session before the swap must never
+      // attach to a hub that is going away.
+      socket.close(this.closeCode, this.closeReason);
       return;
     }
     const session = this.sessions.get(relativePath);
@@ -91,17 +96,44 @@ export class DocumentHub {
     session.attach(socket, canWrite);
   }
 
-  async dispose(): Promise<void> {
+  /**
+   * Stop every document. The flag flips synchronously, before the first await,
+   * so a connection arriving mid-disposal is refused rather than attached.
+   */
+  async dispose(options: { closeCode?: number; reason?: string } = {}): Promise<{ flushErrors: string[] }> {
+    this.closeCode = options.closeCode ?? 1001;
+    this.closeReason = options.reason ?? 'Server is shutting down.';
+    if (this.disposed) return { flushErrors: [] };
     this.disposed = true;
     const sessions = [...this.sessions.values()];
     this.sessions.clear();
     this.pending.clear();
+    const flushErrors: string[] = [];
     await Promise.all(
       sessions.map(async (session) => {
-        session.closeSockets(1001, 'Server is shutting down.');
-        await session.dispose({ persist: true });
+        session.closeSockets(this.closeCode, this.closeReason);
+        // One unwritable file must not abort the switch: record it and move on.
+        const failure = await session.dispose({ persist: true });
+        if (failure) flushErrors.push(session.relativePath);
       }),
     );
+    return { flushErrors };
+  }
+
+  get openDocuments(): number {
+    return this.sessions.size;
+  }
+
+  get documentConnections(): number {
+    let total = 0;
+    for (const session of this.sessions.values()) total += session.connectionCount;
+    return total;
+  }
+
+  get pollingCount(): number {
+    let total = 0;
+    for (const session of this.sessions.values()) if (session.isPolling) total += 1;
+    return total;
   }
 
   async flushSubtree(relativePath: string): Promise<void> {
@@ -182,6 +214,8 @@ export class DocSession {
   private idleTimer: NodeJS.Timeout | undefined;
   private writeChain: Promise<void> = Promise.resolve();
   private disposed = false;
+  /** The file changed on disk while this session had edits; never overwrite it. */
+  private conflicted = false;
   lastSavedAt = Date.now();
   lastError: string | undefined;
 
@@ -267,6 +301,7 @@ export class DocSession {
         // instead of silently picking a winner.
         this.diskSignature = signature;
         this.lastPersisted = content;
+        this.conflicted = true;
         this.broadcastMeta({
           type: 'external',
           conflict: true,
@@ -383,18 +418,40 @@ export class DocSession {
     await this.writeChain;
   }
 
-  async dispose({ persist }: { persist: boolean }): Promise<void> {
-    if (this.disposed) return;
+  /** Returns the write failure for this file, if disposal could not save it. */
+  async dispose({ persist }: { persist: boolean }): Promise<string | undefined> {
+    if (this.disposed) return undefined;
     this.disposed = true;
     clearTimeout(this.saveTimer);
     clearTimeout(this.idleTimer);
     this.stopDiskPoll();
-    if (persist) await this.flush();
+    let failure: string | undefined;
+    if (persist) {
+      if (this.conflicted && this.text.toString() !== this.lastPersisted) {
+        // The Host's copy changed behind this session while it had unsaved
+        // edits. Never overwrite their file, and never drop the edits silently.
+        this.options.logger.warn(
+          `[codepair] ${this.relativePath} changed on the Host while this session had unsaved edits; kept the Host version and did not write the session's edits.`,
+        );
+      } else {
+        await this.flush();
+        if (this.lastError && this.text.toString() !== this.lastPersisted) failure = this.lastError;
+      }
+    }
     await this.writeChain;
     this.awareness.off('update', this.onAwarenessUpdate);
     this.doc.off('update', this.onDocUpdate);
     this.awareness.destroy();
     this.doc.destroy();
+    return failure;
+  }
+
+  get isPolling(): boolean {
+    return this.pollTimer !== undefined;
+  }
+
+  get connectionCount(): number {
+    return this.connections.size;
   }
 
   closeSockets(code: number, reason: string): void {

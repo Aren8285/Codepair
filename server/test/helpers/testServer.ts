@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { parseConfig, type ServerConfig } from '../../src/config.js';
@@ -23,8 +24,17 @@ export interface TestServer {
   wsUrl: string;
   token: string;
   tokens: TestTokens;
+  /** Actual loopback-only admin origin, e.g. `http://127.0.0.1:38291`. */
+  adminBase: string;
+  adminPort: number;
+  adminToken: string;
   /** Authenticated request using the token configured for that role. */
   requestAs: (role: TestRole, route: string, init?: RequestInit) => Promise<Response>;
+  /**
+   * Admin request with the admin token attached by default. Uses `node:http`
+   * rather than fetch so a test can override the `Host` header (undici owns it).
+   */
+  requestAdmin: (route: string, init?: RequestInit) => Promise<Response>;
   cleanup: () => Promise<void>;
 }
 
@@ -41,6 +51,8 @@ export async function startTestServer(
      * with a principal no role can produce (for example an empty capability set).
      */
     authOverride?: Authenticator;
+    /** Interface the guest listener binds to. Defaults to loopback. */
+    bindHost?: string;
   } = {},
 ): Promise<TestServer> {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'codepair-test-'));
@@ -62,6 +74,8 @@ export async function startTestServer(
     [
       '--root',
       root,
+      '--port',
+      '0',
       ...(options.args ?? []),
       ...(options.tokens?.owner ? ['--token', tokens.owner] : []),
       ...(tokens.editor ? ['--editor-token', tokens.editor] : []),
@@ -81,8 +95,10 @@ export async function startTestServer(
     config,
     options.authOverride ? { authenticate: options.authOverride } : undefined,
   );
-  const { port } = await server.start(0, '127.0.0.1');
+  const { port, adminPort } = await server.start(0, options.bindHost ?? '127.0.0.1');
   const baseUrl = `http://127.0.0.1:${port}`;
+  const adminBase = `http://127.0.0.1:${adminPort}`;
+  const adminToken = server.admin.token;
 
   return {
     server,
@@ -92,12 +108,51 @@ export async function startTestServer(
     wsUrl: `ws://127.0.0.1:${port}/ws/doc`,
     token: tokens.owner,
     tokens,
+    adminBase,
+    adminPort,
+    adminToken,
     requestAs: (role: TestRole, route: string, init: RequestInit = {}) => {
       const token = tokens[role];
       if (!token) throw new Error(`No ${role} token is configured on this test server.`);
       const headers = new Headers(init.headers);
       if (!headers.has('Authorization')) headers.set('Authorization', `Bearer ${token}`);
       return fetch(`${baseUrl}${route}`, { ...init, headers });
+    },
+    requestAdmin: (route: string, init: RequestInit = {}) => {
+      const headers = new Headers(init.headers);
+      if (!headers.has('Authorization')) headers.set('Authorization', `Bearer ${adminToken}`);
+      const flat: Record<string, string> = {};
+      headers.forEach((value, key) => {
+        flat[key] = value;
+      });
+      const target = new URL(route, adminBase);
+      return new Promise<Response>((resolve, reject) => {
+        const request = http.request(
+          {
+            hostname: '127.0.0.1',
+            port: adminPort,
+            path: `${target.pathname}${target.search}`,
+            method: init.method ?? 'GET',
+            headers: flat,
+          },
+          (response) => {
+            const chunks: Buffer[] = [];
+            response.on('data', (chunk: Buffer) => chunks.push(chunk));
+            response.on('end', () => {
+              const text = Buffer.concat(chunks).toString('utf8');
+              const responseHeaders: Record<string, string> = {};
+              for (const [key, value] of Object.entries(response.headers)) {
+                if (typeof value === 'string') responseHeaders[key] = value;
+                else if (Array.isArray(value)) responseHeaders[key] = value.join(', ');
+              }
+              resolve(new Response(text, { status: response.statusCode ?? 0, headers: responseHeaders }));
+            });
+          },
+        );
+        request.on('error', reject);
+        if (typeof init.body === 'string') request.write(init.body);
+        request.end();
+      });
     },
     cleanup: async () => {
       await server.close();

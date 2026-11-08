@@ -69,7 +69,8 @@ query strings, `Referer` headers or access logs.
 | --- | --- | --- |
 | `--root <dir>` | cwd | Directory exposed by this session |
 | `--host <host>` | `127.0.0.1` | `0.0.0.0` for LAN access |
-| `--port <port>` | `7420` | |
+| `--port <port>` | `7420` | Guest listener (and tunnel target) |
+| `--admin-port <port>` | `port + 1` | Loopback-only Host console port, bound to `127.0.0.1` regardless of `--host` |
 | `--mode <mode>` | `read-write` | `read-only` makes the primary token a viewer: no writes, deletes or terminal |
 | `--token <token>` | random per start | Primary token: **owner**, or **viewer** with `--mode read-only`. 16–512 bytes, URL-safe |
 | `--editor-token <token>` | — | Extra token with editor access (no `session.admin`) |
@@ -82,7 +83,7 @@ query strings, `Referer` headers or access logs.
 | `--quiet` | off | Less startup output |
 
 Environment equivalents: `CODE_PAIR_MODE`, `CODE_PAIR_TOKEN`, `CODE_PAIR_PORT`,
-`CODE_PAIR_HOST`, `CODE_PAIR_ALLOW_ORIGINS`, `CODE_PAIR_DEV_CLIENT`,
+`CODE_PAIR_ADMIN_PORT`, `CODE_PAIR_HOST`, `CODE_PAIR_ALLOW_ORIGINS`, `CODE_PAIR_DEV_CLIENT`,
 `CODE_PAIR_TERMINAL=off`, `CODE_PAIR_TUNNEL`, `CODE_PAIR_ICE_SERVERS`,
 `CODE_PAIR_MAX_FILE_BYTES`, `CODE_PAIR_SAVE_DEBOUNCE_MS`, `CODE_PAIR_IGNORE`,
 `CODE_PAIR_CLIENT_DIST`.
@@ -105,6 +106,45 @@ Every token maps to exactly one role, and the role decides what that session may
 - `--no-terminal` still wins over every role: no token gets a shell.
 - A viewer's edits are dropped server-side and the UI explains why, but their cursor and
   presence still reach everyone else.
+
+## Host console (admin API)
+
+The Host can move the session to another project at runtime through a separate,
+loopback-only listener. It is a different `http.Server`, bound to `127.0.0.1` on
+`--admin-port` no matter what `--host` says, and none of its routes exist on the
+guest port (the guest app answers `/admin/*` with a 404).
+
+- Its token is generated fresh on every start (`crypto.randomBytes(32)`, base64url) and
+  printed once, on the `Host console:` banner line, inside the `#admin=` fragment. It is
+  never returned in a response body.
+- A request must carry that token as `Authorization: Bearer …`, a `Host` header of
+  `127.0.0.1:<admin-port>` or `localhost:<admin-port>`, no `Origin` unless it is that same
+  loopback origin, and no `X-Forwarded-For` / `X-Forwarded-Host` / `Forwarded` /
+  `CF-Connecting-IP` / `X-Real-IP`. Responses are `no-store` and never CORS.
+- Guest tokens are rejected on this listener and the admin token is rejected on the guest
+  listener. Every route requires the `session.admin` capability.
+
+| Route | Purpose |
+| --- | --- |
+| `GET /admin/api/state` | active session (`id`, `rootName`, `rootPath`, `createdAt`) and open handle counts |
+| `GET /admin/api/fs/list?path=&showHidden=0\|1` | folder picker: directories only, realpath'd, hidden excluded by default, 500-entry cap |
+| `POST /admin/api/session/root` | `{ "path": "…", "confirmBroad": false }` → switches the project root |
+
+Switching validates the path first, builds the new session before touching the old one, swaps
+atomically, then disposes the old one: dirty documents are flushed to their **old** absolute
+paths, external-change pollers stop, every PTY is killed and its rc directory removed, and
+document/terminal sockets close with code `4410` while signalling stays connected.
+
+The filesystem root, the home directory and its parents, and `~/.ssh`, `~/.aws`, `~/.gnupg`,
+`~/.config` are always refused: with home as the root, those credential directories are
+ordinary files that every guest could read. System directories (`/etc`, `/usr`, `/bin`,
+`/sbin`, `/var`, `/System`, `/Library`, `/private`, `/dev`, `/proc`, matched exactly after
+realpath) are refused unless the request sets `"confirmBroad": true`.
+
+Guest tabs are not left silently broken: every document and terminal socket closes with
+`4410`, the app shows one toast — "The host switched to a different project. Reload to
+continue." — plus a warning to copy unsaved work when a tab has edits, and a reload lands in
+the new project.
 
 ## How to use
 

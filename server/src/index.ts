@@ -11,6 +11,7 @@ Options:
   --root <dir>              Directory to expose (default: current directory)
   --host <host>             Bind address (default: 127.0.0.1, use 0.0.0.0 for LAN)
   --port <port>             Port (default: 7420)
+  --admin-port <port>       Loopback-only Host console port (default: port + 1)
   --mode <mode>             "read-write" (default) or "read-only"
   --token <token>           Primary token: owner access, or viewer with --mode read-only
                             (default: random per start)
@@ -26,7 +27,7 @@ Options:
   --version                 Print the version
 
 Environment:
-  CODE_PAIR_MODE, CODE_PAIR_TOKEN, CODE_PAIR_PORT, CODE_PAIR_HOST,
+  CODE_PAIR_MODE, CODE_PAIR_TOKEN, CODE_PAIR_PORT, CODE_PAIR_ADMIN_PORT, CODE_PAIR_HOST,
   CODE_PAIR_ALLOW_ORIGINS, CODE_PAIR_DEV_CLIENT, CODE_PAIR_TERMINAL=off,
   CODE_PAIR_TUNNEL, CODE_PAIR_ICE_SERVERS, CODE_PAIR_MAX_FILE_BYTES,
   CODE_PAIR_SAVE_DEBOUNCE_MS, CODE_PAIR_IGNORE
@@ -44,13 +45,13 @@ async function main(): Promise<void> {
     return;
   }
   if (argv.includes('--version')) {
-    process.stdout.write('0.3.0\n');
+    process.stdout.write('0.3.1\n');
     return;
   }
 
   const config = parseConfig(argv);
   const server = await createCodepairServer(config);
-  const { port } = await server.start();
+  const { port, adminPort } = await server.start();
 
   const displayHost = config.host === '0.0.0.0' || config.host === '::' ? 'localhost' : config.host;
   const localBase = config.devClientUrl ?? `http://${formatHost(displayHost)}:${port}`;
@@ -70,9 +71,16 @@ async function main(): Promise<void> {
   if (!config.quiet) {
     const lines: string[] = [];
     lines.push('');
-    lines.push('  \u001b[38;5;39mCodePair\u001b[0m  \u001b[38;5;242mv0.3.0\u001b[0m');
+    lines.push('  \u001b[38;5;39mCodePair\u001b[0m  \u001b[38;5;242mv0.3.1\u001b[0m');
     lines.push('');
-    lines.push(`  Project   ${server.guard.root}`);
+    lines.push(`  Project   ${server.root}`);
+    // The Host console token is printed exactly once, in this URL fragment.
+    lines.push('');
+    lines.push(`  Host console: \u001b[4mhttp://127.0.0.1:${adminPort}/host#admin=${server.admin.token}\u001b[0m`);
+    lines.push(
+      '  \u001b[38;5;242m(console UI arrives in 0.4; until then use the value after #admin= as a Bearer token)\u001b[0m',
+    );
+    lines.push('');
     lines.push(`  Room      ${config.roomId}`);
     lines.push(`  Mode      ${config.tokens[0]?.role === 'viewer' ? 'read-only' : 'read-write'}`);
     lines.push(

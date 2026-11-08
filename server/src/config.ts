@@ -18,6 +18,8 @@ export interface ServerConfig {
   root: string;
   host: string;
   port: number;
+  /** Loopback-only Host console port. Never configurable to anything but loopback. */
+  adminPort: number;
   /** Primary token: `--token`, or the generated owner token. */
   token: string;
   /** Every token this session accepts, each mapped to one role. */
@@ -79,6 +81,26 @@ export function parseConfig(
   const host = flagValue(flags, 'host') ?? env.CODE_PAIR_HOST ?? '127.0.0.1';
   if (!host.trim()) throw new ConfigError('Host must not be empty.');
 
+  // The admin listener is loopback-only; only its port is configurable.
+  const adminPortRaw = flagValue(flags, 'admin-port') ?? env.CODE_PAIR_ADMIN_PORT;
+  let adminPort: number;
+  if (adminPortRaw !== undefined) {
+    adminPort = Number(adminPortRaw);
+    if (!Number.isInteger(adminPort) || adminPort < 0 || adminPort > 65535) {
+      throw new ConfigError(`Invalid admin port "${adminPortRaw}".`);
+    }
+  } else if (port === 0) {
+    // Tests ask for an ephemeral guest port; the admin port follows suit.
+    adminPort = 0;
+  } else if (port === 65535) {
+    throw new ConfigError('--port 65535 leaves no room for the admin port; pass --admin-port <n>.');
+  } else {
+    adminPort = port + 1;
+  }
+  if (adminPort !== 0 && adminPort === port) {
+    throw new ConfigError('The admin port must differ from the guest port.');
+  }
+
   // `--token` keeps its historical meaning: full access in read-write mode and a
   // read-only viewer in `--mode read-only`. Extra roles are opt-in.
   const primaryRole: Role = mode === 'read-only' ? 'viewer' : 'owner';
@@ -118,6 +140,7 @@ export function parseConfig(
     root,
     host,
     port,
+    adminPort,
     token,
     tokens,
     tokenWasGenerated: envToken === undefined,

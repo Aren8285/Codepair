@@ -17,6 +17,7 @@
  * The file is recreated before each run so results are repeatable.
  */
 import fs from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import puppeteer from 'puppeteer-core';
 
@@ -40,6 +41,9 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 await fs.mkdir(path.dirname(HOST_FILE), { recursive: true });
 await fs.writeFile(HOST_FILE, FIXTURE, 'utf8');
+// A second file, so the root-switch check can have two tabs open at once.
+const SECOND_FILE = path.join(PROJECT, 'second.md');
+await fs.writeFile(SECOND_FILE, '# second tab\n\nUsed to prove one toast per switch.\n', 'utf8');
 await sleep(600); // let the Host watcher settle before clients connect
 
 const results = [];
@@ -281,6 +285,79 @@ try {
   const unexpected = errorsBeforeProbes.filter((line) => !/api\/session.*ERR_ABORTED/.test(line));
   check('no console errors while editing', unexpected.length === 0, unexpected.slice(0, 2).join(' || '));
   check('no uncaught page errors', pageErrors.length === 0, pageErrors.slice(0, 2).join(' || '));
+
+  // 22-24. The Host moves this session to another project while two tabs are
+  // open. Runs last: the switch invalidates everything the checks above use.
+  const adminToken = process.env.CODE_PAIR_ADMIN_TOKEN;
+  if (!adminToken) {
+    console.log('SKIP  switching projects — set CODE_PAIR_ADMIN_TOKEN to include them');
+  } else {
+    const adminBase = process.env.CODE_PAIR_ADMIN_URL ?? `http://127.0.0.1:${Number(new URL(BASE).port) + 1}`;
+    const switchRoot = async (target) =>
+      fetch(`${adminBase}/admin/api/session/root`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${adminToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: target }),
+      }).then(async (response) => ({ status: response.status, body: await response.text() }));
+
+    const rootA = await fs.mkdtemp(path.join(os.tmpdir(), 'codepair-e2e-a-'));
+    const rootB = await fs.mkdtemp(path.join(os.tmpdir(), 'codepair-e2e-b-'));
+    await fs.writeFile(path.join(rootA, 'a.md'), '# first switch\n', 'utf8');
+    await fs.writeFile(path.join(rootB, 'b.md'), '# second switch\n', 'utf8');
+
+    const switchToasts = async () =>
+      waitFor(async () => {
+        const found = await pageA.evaluate(() =>
+          [...document.querySelectorAll('.toast')]
+            .map((el) => el.innerText.replace(/\s+/g, ' ').trim())
+            .filter((text) => text.includes('The host switched to a different project. Reload to continue.')),
+        );
+        return found.length > 0 ? found : false;
+      }, 15000).catch(() => []);
+
+    // Two tabs in the old project: both documents get 4410, exactly one toast shows.
+    await openFile(pageA, 'second.md');
+    const switchedA = await switchRoot(rootA);
+    const firstToasts = await switchToasts();
+
+    // Re-open a document in the new root, then let the toast and the latch expire.
+    await waitFor(async () =>
+      pageA.evaluate(() => [...document.querySelectorAll('button')].some((button) => (button.textContent ?? '').trim() === 'a.md')),
+      15000,
+    );
+    await openFile(pageA, 'a.md');
+    await sleep(3600);
+    const stale = await pageA.evaluate(
+      () => [...document.querySelectorAll('.toast')].filter((el) => el.innerText.includes('switched to a different project')).length,
+    );
+    const switchedB = await switchRoot(rootB);
+    const secondToasts = await switchToasts();
+
+    await pageA.reload({ waitUntil: 'domcontentloaded' });
+    await pageA.waitForSelector('.app', { timeout: 20000 });
+    const reloaded = await waitFor(async () => {
+      const names = await pageA.evaluate(() =>
+        [...document.querySelectorAll('button')].map((button) => (button.textContent ?? '').trim()),
+      );
+      return names.includes('b.md') ? names.filter((name) => name.endsWith('.md')) : false;
+    }, 15000).catch(() => []);
+
+    check(
+      'moving the session to another project shows one toast across two tabs',
+      switchedA.status === 200 && firstToasts.length === 1,
+      JSON.stringify({ switchStatus: switchedA.status, firstToasts }),
+    );
+    check(
+      'a second switch after the toast expires toasts again',
+      stale === 0 && switchedB.status === 200 && secondToasts.length === 1,
+      JSON.stringify({ stale, switchStatus: switchedB.status, secondToasts }),
+    );
+    check('a reload after a switch shows the new project', reloaded.includes('b.md'), JSON.stringify(reloaded));
+
+    await fs.rm(SECOND_FILE, { force: true });
+    await fs.rm(rootA, { recursive: true, force: true });
+    await fs.rm(rootB, { recursive: true, force: true });
+  }
 
   if (process.env.CODE_PAIR_SCREENSHOTS) {
     await pageA.screenshot({ path: process.env.CODE_PAIR_SCREENSHOTS + '/desktop.png' });

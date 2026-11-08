@@ -187,6 +187,8 @@ function Workspace({
   const tabsRef = useRef(tabs);
   const activeRef = useRef(activePath);
   const contentRef = useRef(new Map<string, () => string>());
+  /** One toast per root switch, however many document sockets close. */
+  const hostSwitchNotifiedRef = useRef(false);
   tabsRef.current = tabs;
   activeRef.current = activePath;
 
@@ -351,13 +353,24 @@ function Workspace({
   }, []);
 
   const handleFatal = useCallback(
-    (path: string, message: string, code: number) => {
+    (path: string, _message: string, code: number) => {
       if (code !== 4410) return;
       closePathsUnder(path);
-      notify('info', message || 'This file was closed by the host.');
+      if (hostSwitchNotifiedRef.current) return;
+      hostSwitchNotifiedRef.current = true;
+      // Re-arm, so a host that switches again without a reload still gets told.
+      window.setTimeout(() => {
+        hostSwitchNotifiedRef.current = false;
+      }, 3000);
+      const atRisk = Object.values(editorStatus).some((status) => status.save !== 'saved');
+      notify(
+        'info',
+        'The host switched to a different project. Reload to continue.',
+        atRisk ? 'Some changes in this tab may not have been saved; copy anything important before reloading.' : undefined,
+      );
       void refreshTree();
     },
-    [closePathsUnder, notify, refreshTree],
+    [closePathsUnder, editorStatus, notify, refreshTree],
   );
 
   const createEntry = useCallback(

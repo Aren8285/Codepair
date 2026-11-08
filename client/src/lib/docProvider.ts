@@ -34,6 +34,11 @@ interface ProviderOptions {
   onDirty?: () => void;
 }
 
+/**
+ * 4410 is the Host moving this session to a different project: permanent, never
+ * retried, because the old root is gone. Other codes cover malformed frames,
+ * denied access, a missing file, a replaced session and an oversized document.
+ */
 const PERMANENT_CLOSE_CODES = new Set([4400, 4403, 4404, 4409, 4410, 4413]);
 const MAX_BACKOFF_MS = 8_000;
 
