@@ -35,6 +35,12 @@ Host machine                                    Remote clients
   screen can be sent fullscreen from a button on the tile itself.
 - **Sandboxed paths** — every client-supplied path passes lexical *and* realpath
   containment checks; sensitive names (`.git`, `node_modules`, `.env*`, keys) are hidden.
+- **Path access rules** — per-session `hidden` / `r` / `rw` glob rules, enforced at one
+  choke point across the tree, search, reads, mutations and document sockets; built-in
+  secret defaults stay hidden until the Host explicitly confirms unhiding.
+- **Loopback Host console** — a separate admin listener (own token, its own port) can move
+  the session to another project and replace the rule list live, without disconnecting
+  anyone whose access did not change.
 - **Token auth everywhere** — a random 256-bit token per start, checked on every HTTP
   route and every WebSocket upgrade; the token travels in the URL fragment, never in
   query strings or logs.
@@ -73,7 +79,7 @@ query strings, `Referer` headers or access logs.
 | `--admin-port <port>` | `port + 1` | Loopback-only Host console port, bound to `127.0.0.1` regardless of `--host` |
 | `--mode <mode>` | `read-write` | `read-only` makes the primary token a viewer: no writes, deletes or terminal |
 | `--token <token>` | random per start | Primary token: **owner**, or **viewer** with `--mode read-only`. 16–512 bytes, URL-safe |
-| `--editor-token <token>` | — | Extra token with editor access (no `session.admin`) |
+| `--editor-token <token>` | — | Extra token with editor access |
 | `--viewer-token <token>` | — | Extra token with view-only access |
 | `--no-terminal` | terminal on | Explicit Host opt-out of remote shells |
 | `--rule <glob>=<access>` | — | Path rule (`hidden`, `r`, `rw`), repeatable up to 50, validated at startup |
@@ -256,11 +262,13 @@ slides up as an overlay.
    never appears in the URL. Origin is checked on every upgrade.
 4. **Path sandboxing**: `PathGuard` rejects `..`, absolute paths, NUL bytes and symlink
    escapes with independent lexical and `realpath` checks. Errors never leak absolute
-   server paths.
+   server paths. On top of it, the path access policy can only narrow what a role may
+   reach; hidden paths are indistinguishable from missing ones (`404 NOT_FOUND`).
 5. **Terminal**: the PTY gets a scrubbed environment (no daemon credentials), generated
    rc files hide host history and refuse `cd` out of the root. This is *not* an OS
-   sandbox — a determined operator can still reach anything the Host user can. For hard
-   isolation, run the daemon in a container or keep the session `read-only`.
+   sandbox — a determined operator can still reach anything the Host user can, including
+   files the access policy hides from the editor. For hard isolation, run the daemon in a
+   container or keep the session `read-only`.
 6. **Prefer `read-only`** for demos and public tunnels, a VPN over a public tunnel, and
    HTTPS (the built-in tunnel provides it) so tokens and media never cross plaintext.
 
@@ -298,10 +306,17 @@ CODE_PAIR_ICE_SERVERS='[
   and are not permanent — the URL dies with the process.
 - **Windows is unverified**: symlink checks and shell rc generation are written for POSIX
   shells.
+- **Access-policy limits**: hidden means hidden from the app, not from a shell (the
+  terminal runs as the Host user; `--no-terminal` removes that path). Canonical-path
+  checks are best effort and check-then-act, and hard links are indistinguishable from
+  ordinary files, so they are not detected. The client's `4403` tab-close/toast path is
+  covered by unit and server tests only, not by the browser harness.
 - **Java/C/C++ diagnostics are not provided** — Monaco ships syntax colouring but no
   language server; TypeScript/JavaScript, JSON, CSS and HTML get full bundled workers.
 
 ## Testing
+
+Currently 164 server tests and 24 browser checks.
 
 ```bash
 npm run typecheck     # tsc for server + client
