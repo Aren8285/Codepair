@@ -4,7 +4,7 @@ import path from 'node:path';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import { WebSocketServer } from 'ws';
 import { createAdminApp } from './admin/adminApp.js';
-import { ConfigError, generateToken, type ServerConfig } from './config.js';
+import { ConfigError, generateToken, terminalBypassesRules, type ServerConfig } from './config.js';
 import { AppError, badRequest, unauthorized, toErrorPayload } from './errors.js';
 import { DEFAULT_IGNORED } from './files/fileService.js';
 import {
@@ -27,7 +27,7 @@ import { SignalingHub } from './signaling/signalingHub.js';
 export { CAPABILITY_GATE, requireCap };
 export type { CapabilityGate } from './security/gate.js';
 
-const SERVER_VERSION = '0.3.1';
+export const SERVER_VERSION = '0.3.2';
 const MAX_WS_PAYLOAD = 2 * 1024 * 1024;
 
 /** Tags the `/api` authentication middleware (route audit). */
@@ -92,12 +92,13 @@ export async function createCodepairServer(
   // on it; admin routes are never mounted on the guest listener, so holding
   // `session.admin` on the guest port grants nothing there.
   const adminToken = generateToken();
-  const adminAuthenticator = createAuthenticator([{ token: adminToken, role: 'owner' }]);
+  const adminAuthenticator = createAuthenticator([{ token: adminToken, role: 'host' }]);
   let adminPort: number | undefined;
   const adminApp = createAdminApp({
     sessions,
     authenticate: adminAuthenticator,
     port: () => adminPort ?? 0,
+    terminalBypassesRules: () => terminalBypassesRules(config),
   });
   const adminHttpServer = http.createServer(adminApp);
 
@@ -155,19 +156,19 @@ export async function createCodepairServer(
   app.get('/api/tree', requireCap('fs.read'), asyncRoute(async (request, response) => {
     const session = sessions.current();
     const input = queryString(request.query.path, '');
-    response.json(await session.files.tree(input));
+    response.json(await session.access(principalOf(request)).tree(input));
   }));
 
   app.get('/api/file', requireCap('fs.read'), asyncRoute(async (request, response) => {
     const session = sessions.current();
     const input = requiredQuery(request.query.path);
-    response.json(await session.files.read(input));
+    response.json(await session.access(principalOf(request)).read(input));
   }));
 
   app.get('/api/search', requireCap('fs.read'), asyncRoute(async (request, response) => {
     const session = sessions.current();
     const query = typeof request.query.q === 'string' ? request.query.q.slice(0, 200) : '';
-    response.json(await session.files.search(query));
+    response.json(await session.access(principalOf(request)).search(query));
   }));
 
   app.post('/api/files', requireCap('fs.write'), asyncRoute(async (request, response) => {
@@ -177,7 +178,7 @@ export async function createCodepairServer(
     const type = body.type;
     if (type !== 'file' && type !== 'directory') throw badRequest('type must be "file" or "directory".');
     const content = body.content === undefined ? '' : requireString(body.content, 'content');
-    const entry = await session.files.create(input, type, content);
+    const entry = await session.access(principalOf(request)).create(input, type, content);
     response.status(201).json({ entry });
   }));
 
@@ -188,7 +189,7 @@ export async function createCodepairServer(
     const to = requireString(body.to, 'to');
     await session.documents.flushSubtree(from);
     session.documents.discardSubtree(from, 'This file was renamed.');
-    const entry = await session.files.rename(from, to);
+    const entry = await session.access(principalOf(request)).rename(from, to);
     response.json({ entry });
   }));
 
@@ -197,7 +198,7 @@ export async function createCodepairServer(
     const input = typeof request.query.path === 'string' ? request.query.path : undefined;
     if (!input) throw badRequest('path query parameter is required.');
     session.documents.discardSubtree(input, 'This file was deleted.');
-    const result = await session.files.remove(input);
+    const result = await session.access(principalOf(request)).remove(input);
     response.json(result);
   }));
 
@@ -318,11 +319,19 @@ export async function createCodepairServer(
       // One resolution per connection: everything below uses this session,
       // even if the Host switches root while the file is being read.
       const session = sessions.current();
+      const access = session.access(principal);
       try {
         session.pathGuard.resolve(docPath);
       } catch (error) {
         const message = error instanceof SandboxError ? error.message : 'Invalid path.';
         rejectUpgrade(socket, 403, 'Forbidden', message);
+        return;
+      }
+      // A hidden file must be indistinguishable from a missing one: same status,
+      // same reason phrase, same message, and no file read has happened yet.
+      const decision = access.documentAccess(docPath);
+      if (!decision.visible) {
+        rejectUpgrade(socket, 404, 'Cannot Open File', 'That path does not exist.');
         return;
       }
 
@@ -337,7 +346,7 @@ export async function createCodepairServer(
             // client stops reconnecting instead of seeing a rejected upgrade.
             docWss.handleUpgrade(request, socket, head, (webSocket) => {
               docWss.emit('connection', webSocket, request);
-              session.documents.connect(docPath, webSocket, can(principal, 'fs.write'));
+              session.documents.connect(docPath, webSocket, decision.write, access.view);
             });
             return;
           }
@@ -349,7 +358,7 @@ export async function createCodepairServer(
         if (socket.destroyed) return;
         docWss.handleUpgrade(request, socket, head, (webSocket) => {
           docWss.emit('connection', webSocket, request);
-          session.documents.connect(docPath, webSocket, can(principal, 'fs.write'));
+          session.documents.connect(docPath, webSocket, decision.write, access.view);
         });
       })();
       return;

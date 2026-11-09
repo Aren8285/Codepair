@@ -189,6 +189,8 @@ function Workspace({
   const contentRef = useRef(new Map<string, () => string>());
   /** One toast per root switch, however many document sockets close. */
   const hostSwitchNotifiedRef = useRef(false);
+  /** One toast per path the Host hid, until that tab is opened again. */
+  const policyDeniedRef = useRef<Set<string>>(new Set());
   tabsRef.current = tabs;
   activeRef.current = activePath;
 
@@ -302,6 +304,8 @@ function Workspace({
   }, []);
 
   const openPath = useCallback((path: string) => {
+    // Reopening a tab re-arms its denial notice, so a later hide toasts again.
+    policyDeniedRef.current.delete(path);
     const current = tabsRef.current;
     const next = current.includes(path) ? current : [...current, path];
     tabsRef.current = next;
@@ -353,7 +357,16 @@ function Workspace({
   }, []);
 
   const handleFatal = useCallback(
-    (path: string, _message: string, code: number) => {
+    (path: string, message: string, code: number) => {
+      if (code === 4403) {
+        // The Host removed access to this file. Close its tab and explain once
+        // per path; this has its own dedupe, independent of the 4410 latch.
+        closePathsUnder(path);
+        if (policyDeniedRef.current.has(path)) return;
+        policyDeniedRef.current.add(path);
+        notify('error', message || 'The host removed access to this file.');
+        return;
+      }
       if (code !== 4410) return;
       closePathsUnder(path);
       if (hostSwitchNotifiedRef.current) return;

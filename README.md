@@ -76,6 +76,8 @@ query strings, `Referer` headers or access logs.
 | `--editor-token <token>` | — | Extra token with editor access (no `session.admin`) |
 | `--viewer-token <token>` | — | Extra token with view-only access |
 | `--no-terminal` | terminal on | Explicit Host opt-out of remote shells |
+| `--rule <glob>=<access>` | — | Path rule (`hidden`, `r`, `rw`), repeatable up to 50, validated at startup |
+| `--confirm-unhide` | off | Required when a `--rule` lifts a built-in secret default |
 | `--tunnel <provider>` | off | `cloudflare` or `ngrok` public tunnel |
 | `--ice-servers <json>` | Google STUN | JSON `RTCIceServer[]`, max 8 entries |
 | `--allow-origin <origin>` | — | Extra origin allowed to open WebSockets |
@@ -94,7 +96,8 @@ Every token maps to exactly one role, and the role decides what that session may
 
 | Role | Capabilities | Can do |
 | --- | --- | --- |
-| `owner` | `fs.read`, `fs.write`, `fs.delete`, `term.use`, `call.join`, `session.admin` | everything |
+| `owner` | `fs.read`, `fs.write`, `fs.delete`, `term.use`, `call.join` | everything except administration |
+| `host` | `session.admin` | the Host console only; never a guest listener |
 | `editor` | `fs.read`, `fs.write`, `fs.delete`, `term.use`, `call.join` | edit, delete, terminal, calls |
 | `viewer` | `fs.read`, `call.join` | read files, receive live edits, join calls |
 
@@ -106,6 +109,55 @@ Every token maps to exactly one role, and the role decides what that session may
 - `--no-terminal` still wins over every role: no token gets a shell.
 - A viewer's edits are dropped server-side and the UI explains why, but their cursor and
   presence still reach everyone else.
+
+## Path access policy
+
+Every session starts with the built-in secret patterns hidden, whatever the Host’s rules
+say. Rules only ever narrow access: the result is the most restrictive of the rule and the
+token’s capabilities, so `rw` never gives a viewer a write it did not already have.
+
+| Access | Effect |
+| --- | --- |
+| `hidden` | Invisible: omitted from the tree, never matched or descended into by search, `404 NOT_FOUND` on read (byte-identical to a missing file), document socket refused with `404` |
+| `r` | Readable and watchable; edits are refused with the usual `denied` meta |
+| `rw` | Read and write, still limited by the token’s capabilities |
+
+Matching is case-insensitive on NFC-normalised, `/`-separated project-relative paths:
+
+| Pattern | Matches |
+| --- | --- |
+| `notes.md` | that basename at any depth |
+| `docs/**` | `docs` itself and everything beneath it |
+| `config/*.json` | one level under `config` (a pattern containing `/` is anchored at the root) |
+| `*.pem` | any basename ending in `.pem`; `*` matches a leading dot too |
+| `?` | exactly one character that is not `/` |
+
+The first matching host rule wins. Paths are decided twice — as requested and as their
+canonical target (existing segments are `realpath`’d) — and the stricter result applies, so
+a visible-named symlink to a hidden file is hidden. Canonicalisation is best effort and not
+atomic: like the path guard, it is check-then-act, so a path swapped between the check and
+the file operation is outside what this layer can promise. Hard links are indistinguishable
+from ordinary files and are not detected.
+
+**The defaults are a floor.** A path matching a built-in secret stays `hidden` even under a
+host rule that allows it, until the Host confirms unhiding. Confirmation is per PUT: it
+applies only to the request that carries `confirmUnhide: true` (or `--confirm-unhide` at
+startup), is echoed by every `GET`/`PUT`, and resets on the next PUT that omits it and on
+every root switch. A rule that would lift a default without confirmation is refused with
+`UNHIDE_SECRET` (startup: `ConfigError`), so a typo like `**=rw` cannot quietly expose
+`.env`.
+
+**Live changes never drop accepted work.** A PUT flushes pending debounced saves first,
+holds incoming document frames while the rules are installed, then replays those frames in
+arrival order under the new access: an edit to a file whose access did not change still
+lands and reaches other clients; an edit the new access forbids is answered with `denied`
+and never reaches disk. An open document that becomes hidden is closed with `4403`; the app
+closes its tab and shows one toast, reopening the tab re-arms that notice.
+
+**The terminal bypasses all of this.** A shell runs as the Host user with the project’s
+permissions, so `cat .env` works even though the editor cannot open it. When any role has a
+shell, the startup banner says so and `GET /admin/api/state` reports
+`terminalBypassesRules: true`; `--no-terminal` removes both the shell and the warning.
 
 ## Host console (admin API)
 
@@ -129,6 +181,8 @@ guest port (the guest app answers `/admin/*` with a 404).
 | `GET /admin/api/state` | active session (`id`, `rootName`, `rootPath`, `createdAt`) and open handle counts |
 | `GET /admin/api/fs/list?path=&showHidden=0\|1` | folder picker: directories only, realpath'd, hidden excluded by default, 500-entry cap |
 | `POST /admin/api/session/root` | `{ "path": "…", "confirmBroad": false }` → switches the project root |
+| `GET /admin/api/policy` | current `rules`, the built-in `defaults`, `confirmUnhide`, `terminalBypassesRules` |
+| `PUT /admin/api/policy/rules` | `{ "rules": [{ "pattern": "…", "access": "hidden\|r\|rw" }], "confirmUnhide": false }` → validates, flushes open documents, applies, echoes `rules`/`confirmUnhide`/`affected` |
 
 Switching validates the path first, builds the new session before touching the old one, swaps
 atomically, then disposes the old one: dirty documents are flushed to their **old** absolute

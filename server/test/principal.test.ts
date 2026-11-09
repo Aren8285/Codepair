@@ -8,7 +8,7 @@ import {
   type Role,
 } from '../src/security/principal.js';
 
-const ROLES: Role[] = ['owner', 'editor', 'viewer'];
+const ROLES: Role[] = ['owner', 'editor', 'viewer', 'host'];
 
 describe('principals', () => {
   it('maps each role to exactly the documented capabilities', () => {
@@ -18,11 +18,16 @@ describe('principals', () => {
       expect([...principal.capabilities].sort()).toEqual([...ROLE_CAPABILITIES[role]].sort());
     }
 
-    expect([...ROLE_CAPABILITIES.owner].sort()).toEqual([...CAPABILITIES].sort());
+    // The Host principal is the only one that administers the session; the
+    // owner token is a guest role and must never carry `session.admin`.
+    expect([...ROLE_CAPABILITIES.owner].sort()).toEqual(
+      ['fs.read', 'fs.write', 'fs.delete', 'term.use', 'call.join'].sort(),
+    );
     expect([...ROLE_CAPABILITIES.editor].sort()).toEqual(
       ['fs.read', 'fs.write', 'fs.delete', 'term.use', 'call.join'].sort(),
     );
     expect([...ROLE_CAPABILITIES.viewer].sort()).toEqual(['fs.read', 'call.join'].sort());
+    expect([...ROLE_CAPABILITIES.host]).toEqual(['session.admin']);
   });
 
   it('never grants a capability outside CAPABILITIES', () => {
@@ -72,10 +77,21 @@ describe('principals', () => {
     }
   });
 
-  it('grants every capability to owners', () => {
+  it('grants owners every guest capability but never session.admin', () => {
     const owner = makePrincipal('owner');
     for (const capability of CAPABILITIES) {
+      if (capability === 'session.admin') continue;
       expect(can(owner, capability)).toBe(true);
+    }
+    expect(can(owner, 'session.admin')).toBe(false);
+  });
+
+  it('gives the host principal session.admin and nothing else', () => {
+    const host = makePrincipal('host');
+    expect([...host.capabilities]).toEqual(['session.admin']);
+    expect(can(host, 'session.admin')).toBe(true);
+    for (const capability of ['fs.read', 'fs.write', 'fs.delete', 'term.use', 'call.join'] as const) {
+      expect(can(host, capability)).toBe(false);
     }
   });
 });

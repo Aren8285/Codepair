@@ -2,7 +2,8 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
-import { AppError } from '../errors.js';
+import { AppError, notFound } from '../errors.js';
+import type { Access } from '../security/accessPolicy.js';
 import { PathGuard } from '../security/pathGuard.js';
 
 export const DEFAULT_IGNORED = [
@@ -35,7 +36,12 @@ export interface FileEntry {
   mtime?: number;
   symlink?: boolean;
   blocked?: boolean;
+  /** Effective access for the requesting principal: never `hidden` (omitted). */
+  access?: 'r' | 'rw';
 }
+
+/** Policy hook: decide an entry's access from its relative and canonical path. */
+export type AccessDecider = (relativePath: string, canonicalRelative: string | null) => Access;
 
 export interface TreeResult {
   path: string;
@@ -65,7 +71,7 @@ export class FileService {
     return this.options.maxFileBytes;
   }
 
-  async tree(relativeDir = ''): Promise<TreeResult> {
+  async tree(relativeDir = '', decide?: AccessDecider): Promise<TreeResult> {
     const absolute = this.guard.resolve(relativeDir);
     const stat = await fsp.stat(absolute);
     if (!stat.isDirectory()) throw new AppError(400, 'NOT_A_DIRECTORY', 'That path is not a directory.');
@@ -76,25 +82,23 @@ export class FileService {
 
     for (const dirent of dirents) {
       if (this.options.ignored.has(dirent.name)) continue;
-      if (entries.length >= MAX_TREE_ENTRIES) {
-        truncated = true;
-        break;
-      }
       const childRelative = relativeDir ? `${relativeDir}/${dirent.name}` : dirent.name;
       let symlink = false;
       let blocked = false;
       let size: number | undefined;
       let mtime: number | undefined;
+      let canonicalRelative: string | null = childRelative;
 
       if (dirent.isSymbolicLink()) {
         symlink = true;
         try {
-          this.guard.toRelative(fs.realpathSync(path.join(absolute, dirent.name)));
+          canonicalRelative = this.guard.toRelative(fs.realpathSync(path.join(absolute, dirent.name)));
           const target = await fsp.stat(path.join(absolute, dirent.name));
           size = target.isFile() ? target.size : undefined;
           mtime = target.mtimeMs;
         } catch {
           blocked = true;
+          canonicalRelative = null;
         }
       } else {
         try {
@@ -106,6 +110,14 @@ export class FileService {
         }
       }
 
+      // Hidden entries are omitted entirely and never consume the cap.
+      const access = decide ? decide(childRelative, canonicalRelative) : 'rw';
+      if (access === 'hidden') continue;
+      if (entries.length >= MAX_TREE_ENTRIES) {
+        truncated = true;
+        break;
+      }
+
       entries.push({
         name: dirent.name,
         path: childRelative,
@@ -114,6 +126,7 @@ export class FileService {
         ...(mtime !== undefined ? { mtime } : {}),
         ...(symlink ? { symlink: true } : {}),
         ...(blocked ? { blocked: true } : {}),
+        access: access === 'rw' ? 'rw' : 'r',
       });
     }
 
@@ -133,13 +146,21 @@ export class FileService {
   async readTextForDocument(relativePath: string): Promise<{
     absolute: string;
     relative: string;
+    canonicalRelative: string;
     content: string;
     mtime: number;
     ino: number;
   }> {
     if (!relativePath) throw new AppError(400, 'INVALID_PATH', 'A file path is required.');
     const absolute = this.guard.resolve(relativePath);
-    const stat = await fsp.stat(absolute);
+    let stat;
+    try {
+      stat = await fsp.stat(absolute);
+    } catch (error) {
+      // One 404 shape for a missing path, used by the hidden-path decision too.
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw notFound('That path does not exist.');
+      throw error;
+    }
     if (!stat.isFile()) throw new AppError(400, 'INVALID_PATH', 'That path is not a file.');
     if (stat.size > this.options.maxFileBytes) {
       throw new AppError(413, 'FILE_TOO_LARGE', `Files larger than ${formatBytes(this.options.maxFileBytes)} cannot be opened.`);
@@ -148,9 +169,16 @@ export class FileService {
     if (buffer.subarray(0, BINARY_SNIFF_BYTES).includes(0)) {
       throw new AppError(400, 'BINARY_FILE', 'Binary files cannot be opened in the editor.');
     }
+    let canonicalRelative: string;
+    try {
+      canonicalRelative = this.guard.toRelative(fs.realpathSync(absolute));
+    } catch {
+      canonicalRelative = this.guard.toRelative(absolute);
+    }
     return {
       absolute,
       relative: this.guard.toRelative(absolute),
+      canonicalRelative,
       content: buffer.toString('utf8'),
       mtime: stat.mtimeMs,
       ino: stat.ino,
@@ -228,7 +256,10 @@ export class FileService {
     return { path: this.guard.toRelative(absolute) };
   }
 
-  async search(query: string): Promise<{ query: string; entries: FileEntry[]; truncated: boolean }> {
+  async search(
+    query: string,
+    decide?: AccessDecider,
+  ): Promise<{ query: string; entries: FileEntry[]; truncated: boolean }> {
     const needle = query.trim().toLowerCase();
     if (!needle) return { query, entries: [], truncated: false };
 
@@ -254,10 +285,14 @@ export class FileService {
         if (this.options.ignored.has(dirent.name)) continue;
         if (dirent.isSymbolicLink()) continue;
         const child = relativeDir ? `${relativeDir}/${dirent.name}` : dirent.name;
+        const access = decide ? decide(child, child) : 'rw';
+        // Never listed and never descended into: hidden content can never leak
+        // through search, including as a directory listing side effect.
+        if (access === 'hidden') continue;
         if (dirent.isDirectory()) {
           queue.push(child);
         } else if (dirent.name.toLowerCase().includes(needle)) {
-          entries.push({ name: dirent.name, path: child, type: 'file' });
+          entries.push({ name: dirent.name, path: child, type: 'file', access: access === 'rw' ? 'rw' : 'r' });
           if (entries.length >= MAX_SEARCH_RESULTS) {
             truncated = true;
             break;

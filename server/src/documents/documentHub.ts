@@ -7,6 +7,7 @@ import * as decoding from 'lib0/decoding';
 import * as encoding from 'lib0/encoding';
 import { atomicWriteFile, FileService } from '../files/fileService.js';
 import { AppError } from '../errors.js';
+import type { AccessPolicy, AccessView, Rule } from '../security/accessPolicy.js';
 
 export const MESSAGE_SYNC = 0;
 export const MESSAGE_AWARENESS = 1;
@@ -37,17 +38,31 @@ type MetaMessage =
 class DocConnection {
   alive = true;
   readonly awarenessIds = new Set<number>();
+  /** Policy decision for this connection, re-evaluated on every rule change. */
+  view: AccessView | undefined;
+  /** Never upgraded back to writable while this socket lives. */
+  revoked = false;
+  readonly grantedWrite: boolean;
 
   constructor(
     readonly socket: WebSocket,
     readonly canWrite: boolean,
-  ) {}
+  ) {
+    this.grantedWrite = canWrite;
+  }
+}
+
+/** Frames held while the Host's rules change, replayed in arrival order. */
+interface FrameGate {
+  queue: Array<() => void>;
 }
 
 interface HubOptions {
   saveDebounceMs: number;
   idleCloseMs?: number;
   logger?: Pick<Console, 'error' | 'warn'>;
+  /** The session policy, shared with the file choke point. */
+  policy: AccessPolicy;
 }
 
 export class DocumentHub {
@@ -60,6 +75,9 @@ export class DocumentHub {
   disposed = false;
   private closeCode = 1001;
   private closeReason = 'Server is shutting down.';
+  private readonly policy: AccessPolicy;
+  /** Non-undefined only while the rules are being replaced. */
+  private gate: FrameGate | undefined;
 
   constructor(
     private readonly files: FileService,
@@ -68,6 +86,7 @@ export class DocumentHub {
     this.saveDebounceMs = options.saveDebounceMs;
     this.idleCloseMs = options.idleCloseMs ?? IDLE_CLOSE_MS;
     this.logger = options.logger ?? console;
+    this.policy = options.policy;
   }
 
   /**
@@ -81,7 +100,7 @@ export class DocumentHub {
   }
 
   /** Attach an upgraded socket to an already prepared document. */
-  connect(relativePath: string, socket: WebSocket, canWrite: boolean): void {
+  connect(relativePath: string, socket: WebSocket, canWrite: boolean, view?: AccessView): void {
     if (this.disposed) {
       // A connection that resolved this session before the swap must never
       // attach to a hub that is going away.
@@ -93,7 +112,41 @@ export class DocumentHub {
       socket.close(4404, 'Could not open file.');
       return;
     }
-    session.attach(socket, canWrite);
+    const allowed =
+      canWrite && (view ? view.write(session.relativePath, session.canonicalRelative) : true);
+    session.attach(socket, allowed, view);
+  }
+
+  /**
+   * Install new rules and apply them to live documents.
+   *
+   * Order matters: frames are held, everything accepted under the old rules is
+   * flushed, only then are the rules replaced. Held frames are replayed in
+   * arrival order afterwards, each decided by that connection's NEW access — so
+   * an edit in an unaffected file still lands, and an edit the new access
+   * forbids is refused with the usual `denied` meta instead of vanishing.
+   */
+  async applyPolicy(
+    rules: readonly Rule[],
+    confirmUnhide: boolean,
+  ): Promise<{ closed: number; downgraded: number }> {
+    const gate: FrameGate = { queue: [] };
+    this.gate = gate;
+    let closed = 0;
+    let downgraded = 0;
+    try {
+      await Promise.all([...this.sessions.values()].map((session) => session.flush()));
+      this.policy.setRules(rules, confirmUnhide);
+      for (const session of this.sessions.values()) {
+        const result = session.enforce();
+        closed += result.closed;
+        downgraded += result.downgraded;
+      }
+    } finally {
+      this.gate = undefined;
+    }
+    for (const run of gate.queue) run();
+    return { closed, downgraded };
   }
 
   /**
@@ -171,6 +224,7 @@ export class DocumentHub {
       idleCloseMs: this.idleCloseMs,
       maxFileBytes: this.files.maxFileBytes,
       logger: this.logger,
+      gate: () => this.gate,
       onIdle: (session) => {
         if (this.sessions.get(session.relativePath) === session) {
           this.sessions.delete(session.relativePath);
@@ -198,6 +252,7 @@ interface SessionOptions {
   maxFileBytes: number;
   logger: Pick<Console, 'error' | 'warn'>;
   onIdle: (session: DocSession) => void;
+  gate: () => FrameGate | undefined;
 }
 
 export class DocSession {
@@ -222,6 +277,8 @@ export class DocSession {
   private constructor(
     readonly absolutePath: string,
     readonly relativePath: string,
+    /** Realpath of the file inside the root; policy decisions use both paths. */
+    readonly canonicalRelative: string,
     initialContent: string,
     options: SessionOptions,
   ) {
@@ -240,7 +297,13 @@ export class DocSession {
 
   static async open(files: FileService, relativePath: string, options: SessionOptions): Promise<DocSession> {
     const file = await files.readTextForDocument(relativePath);
-    const session = new DocSession(file.absolute, file.relative, file.content, options);
+    const session = new DocSession(
+      file.absolute,
+      file.relative,
+      file.canonicalRelative,
+      file.content,
+      options,
+    );
     session.diskSignature = { ino: file.ino, mtimeMs: file.mtime, size: Buffer.byteLength(file.content) };
     return session;
   }
@@ -333,13 +396,14 @@ export class DocSession {
     for (const connection of this.connections) this.sendMeta(connection.socket, meta);
   }
 
-  attach(socket: WebSocket, canWrite: boolean): void {
+  attach(socket: WebSocket, canWrite: boolean, view?: AccessView): void {
     if (this.disposed) {
       socket.close(1001, 'Document closed.');
       return;
     }
     this.cancelIdleClose();
     const connection = new DocConnection(socket, canWrite);
+    connection.view = view;
     this.connections.add(connection);
     this.startDiskPoll();
 
@@ -369,14 +433,14 @@ export class DocSession {
 
     socket.on('message', (data, isBinary) => {
       if (!isBinary) return;
-      try {
-        this.handleMessage(connection, toUint8Array(data));
-      } catch (error) {
-        this.options.logger.warn(
-          `[codepair] closing ${this.relativePath}: malformed document message (${error instanceof Error ? error.message : 'unknown error'})`,
-        );
-        connection.socket.close(4400, 'Malformed document message.');
+      const bytes = toUint8Array(data);
+      const gate = this.options.gate();
+      if (gate) {
+        // Held, never dropped: replayed in arrival order once the new rules are in.
+        gate.queue.push(() => this.receive(connection, bytes));
+        return;
       }
+      this.receive(connection, bytes);
     });
     socket.on('pong', () => {
       connection.alive = true;
@@ -409,6 +473,54 @@ export class DocSession {
       }
     }, HEARTBEAT_MS);
     socket.once('close', () => clearInterval(heartbeat));
+  }
+
+  private receive(connection: DocConnection, data: Uint8Array): void {
+    try {
+      this.handleMessage(connection, data);
+    } catch (error) {
+      this.options.logger.warn(
+        `[codepair] closing ${this.relativePath}: malformed document message (${error instanceof Error ? error.message : 'unknown error'})`,
+      );
+      connection.socket.close(4400, 'Malformed document message.');
+    }
+  }
+
+  /** Re-evaluate this document's live connections after a rule change. */
+  enforce(): { closed: number; downgraded: number } {
+    let closed = 0;
+    let downgraded = 0;
+    for (const connection of [...this.connections]) {
+      const access = connection.view
+        ? connection.view.decide(this.relativePath, this.canonicalRelative)
+        : 'rw';
+      if (access === 'hidden') {
+        this.connections.delete(connection);
+        try {
+          connection.socket.close(4403, 'The host removed access to this file.');
+        } catch {
+          connection.socket.terminate();
+        }
+        closed += 1;
+        continue;
+      }
+      if (connection.grantedWrite && !this.mayWrite(connection) && !connection.revoked) {
+        connection.revoked = true;
+        downgraded += 1;
+      }
+    }
+    if (this.connections.size === 0) {
+      this.stopDiskPoll();
+      this.scheduleIdleClose();
+    }
+    return { closed, downgraded };
+  }
+
+  /** Can this connection still write under the CURRENT rules? Never re-upgraded. */
+  private mayWrite(connection: DocConnection): boolean {
+    if (connection.revoked) return false;
+    if (!connection.view) return connection.canWrite;
+    return connection.view.write(this.relativePath, this.canonicalRelative);
   }
 
   async flush(): Promise<void> {
@@ -544,7 +656,7 @@ export class DocSession {
         return;
       }
       if (syncType === syncProtocol.messageYjsSyncStep2) {
-        if (!connection.canWrite) {
+        if (!this.mayWrite(connection)) {
           // A client that connected with a diverged document ships its edits in
           // the step 2 answer, not as a live update. Drop them and say so; stay
           // silent for an empty diff so a plain read-only open is not noisy.
@@ -560,7 +672,7 @@ export class DocSession {
         return;
       }
       if (syncType === syncProtocol.messageYjsUpdate) {
-        if (!connection.canWrite) {
+        if (!this.mayWrite(connection)) {
           this.sendMeta(connection.socket, {
             type: 'denied',
             reason: 'This session is read-only; edits are not applied.',
@@ -583,7 +695,7 @@ export class DocSession {
         const text = new TextDecoder().decode(raw);
         if (text.length > 2048) return;
         const payload = JSON.parse(text) as { type?: unknown };
-        if (payload?.type === 'flush' && connection.canWrite) {
+        if (payload?.type === 'flush' && this.mayWrite(connection)) {
           void this.flush()
             .then(() => {
               this.lastSavedAt = Date.now();

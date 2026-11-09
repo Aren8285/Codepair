@@ -1,6 +1,7 @@
 import path from 'node:path';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import { AppError, toErrorPayload, unauthorized } from '../errors.js';
+import { DEFAULT_SECRET_RULES, rulesUnhideDefaults, validateRules } from '../security/accessPolicy.js';
 import { tokenFromAuthorizationHeader, type Authenticator } from '../security/auth.js';
 import { requireCap } from '../security/gate.js';
 import { securityHeaders } from '../security/headers.js';
@@ -24,6 +25,8 @@ export interface AdminAppOptions {
   authenticate: Authenticator;
   /** Actual bound port; 0 until the listener is up (then every request is refused). */
   port: () => number;
+  /** Config-derived: does a shell bypass the path policy in this session? */
+  terminalBypassesRules: () => boolean;
   logger?: Pick<Console, 'log' | 'error'>;
 }
 
@@ -63,6 +66,7 @@ export function createAdminApp(options: AdminAppOptions): express.Express {
       openDocuments: session.documents.openDocuments,
       documentConnections: session.documents.documentConnections,
       terminals: session.terminals.activeSessions,
+      terminalBypassesRules: options.terminalBypassesRules(),
     });
   });
 
@@ -73,6 +77,53 @@ export function createAdminApp(options: AdminAppOptions): express.Express {
       const raw = typeof request.query.path === 'string' ? request.query.path : undefined;
       const showHidden = request.query.showHidden === '1' || request.query.showHidden === 'true';
       response.json(await listHostDirectories(raw, showHidden));
+    }),
+  );
+
+  app.get('/admin/api/policy', requireCap('session.admin'), (_request, response) => {
+    const session = options.sessions.current();
+    response.json({
+      rules: session.policy.rules,
+      defaults: DEFAULT_SECRET_RULES,
+      confirmUnhide: session.policy.confirmUnhide,
+      terminalBypassesRules: options.terminalBypassesRules(),
+    });
+  });
+
+  app.put(
+    '/admin/api/policy/rules',
+    requireCap('session.admin'),
+    asyncRoute(async (request, response) => {
+      const body = asRecord(request.body);
+      const unknown = Object.keys(body).filter((key) => key !== 'rules' && key !== 'confirmUnhide');
+      if (unknown.length > 0) {
+        throw new AppError(400, 'BAD_REQUEST', `Unknown field(s): ${unknown.join(', ')}.`);
+      }
+      if (body.rules === undefined) {
+        throw new AppError(400, 'BAD_REQUEST', '"rules" is required.');
+      }
+      if (body.confirmUnhide !== undefined && typeof body.confirmUnhide !== 'boolean') {
+        throw new AppError(400, 'BAD_REQUEST', '"confirmUnhide" must be a boolean.');
+      }
+      // Validate everything before touching the live list: a bad request must
+      // change nothing, and lifting a default needs an explicit confirmation.
+      const rules = validateRules(body.rules);
+      const confirmUnhide = body.confirmUnhide === true;
+      if (rulesUnhideDefaults(rules) && !confirmUnhide) {
+        throw new AppError(
+          400,
+          'UNHIDE_SECRET',
+          'Those rules expose a built-in secret default; pass confirmUnhide: true to allow it.',
+        );
+      }
+
+      const session = options.sessions.current();
+      const affected = await session.documents.applyPolicy(rules, confirmUnhide);
+      response.json({
+        rules: session.policy.rules,
+        confirmUnhide: session.policy.confirmUnhide,
+        affected,
+      });
     }),
   );
 

@@ -1,8 +1,14 @@
 import { randomBytes } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  MAX_STARTUP_RULES,
+  parseRuleArgument,
+  rulesUnhideDefaults,
+  type Rule,
+} from './security/accessPolicy.js';
 import type { TokenGrant } from './security/auth.js';
-import type { Role } from './security/principal.js';
+import { capabilitiesForRole, type Role } from './security/principal.js';
 
 export type AccessMode = 'read-only' | 'read-write';
 export type TunnelProvider = 'cloudflare' | 'ngrok';
@@ -34,6 +40,10 @@ export interface ServerConfig {
   saveDebounceMs: number;
   maxFileBytes: number;
   terminalEnabled: boolean;
+  /** Host path rules given at startup with `--rule`, already parsed. */
+  rules: Rule[];
+  /** The Host confirmed lifting a built-in secret default (`--confirm-unhide`). */
+  confirmUnhide: boolean;
   iceServers: IceServerConfig[];
   tunnelProvider?: TunnelProvider;
   clientDist: string;
@@ -136,6 +146,24 @@ export function parseConfig(
     throw new ConfigError('--tunnel must be "cloudflare" or "ngrok".');
   }
 
+  // Repeatable `--rule "<glob>=<hidden|r|rw>"`: a bad rule is a startup error,
+  // and lifting a built-in secret default requires --confirm-unhide.
+  const ruleRaw = flagValue(flags, 'rule');
+  const ruleValues = ruleRaw === undefined ? [] : ruleRaw.split('\u001f');
+  if (ruleValues.length > MAX_STARTUP_RULES) {
+    throw new ConfigError(`--rule may be given at most ${MAX_STARTUP_RULES} times.`);
+  }
+  let rules: Rule[];
+  try {
+    rules = ruleValues.map((value) => parseRuleArgument(value));
+  } catch (error) {
+    throw new ConfigError(error instanceof Error ? error.message : 'Invalid --rule.');
+  }
+  const confirmUnhide = flags['confirm-unhide'] === true;
+  if (rulesUnhideDefaults(rules) && !confirmUnhide) {
+    throw new ConfigError('A --rule exposes a built-in secret default; pass --confirm-unhide to allow it.');
+  }
+
   return {
     root,
     host,
@@ -150,6 +178,8 @@ export function parseConfig(
     saveDebounceMs: Number(env.CODE_PAIR_SAVE_DEBOUNCE_MS ?? 300),
     maxFileBytes: Number(env.CODE_PAIR_MAX_FILE_BYTES ?? 5 * 1024 * 1024),
     terminalEnabled: !flags['no-terminal'] && env.CODE_PAIR_TERMINAL !== 'off',
+    rules,
+    confirmUnhide,
     iceServers: parseIceServers(flagValue(flags, 'ice-servers') ?? env.CODE_PAIR_ICE_SERVERS),
     tunnelProvider: tunnelRaw as TunnelProvider | undefined,
     clientDist: path.resolve(
@@ -180,6 +210,9 @@ function parseFlags(argv: string[]): Record<string, string | true> {
     if (next !== undefined && !next.startsWith('--')) {
       if (name === 'allow-origin' && typeof result[name] === 'string') {
         result[name] = `${result[name]},${next}`;
+      } else if (name === 'rule' && typeof result[name] === 'string') {
+        // Repeatable: join with a separator no rule can contain.
+        result[name] = `${result[name]}\u001f${next}`;
       } else {
         result[name] = next;
       }
@@ -272,4 +305,13 @@ function assertDistinctTokens(tokens: TokenGrant[]): void {
 
 export function normalizeMode(value: string | undefined): AccessMode {
   return value === 'read-only' ? 'read-only' : 'read-write';
+}
+
+/** Banner line printed when a shell can read files the path policy hides. */
+export const TERMINAL_BYPASS_WARNING = 'Terminal access bypasses path rules; hidden files are readable from a shell.';
+
+/** Is a shell available to any configured role? Then path rules do not apply to it. */
+export function terminalBypassesRules(config: Pick<ServerConfig, 'terminalEnabled' | 'tokens'>): boolean {
+  if (!config.terminalEnabled) return false;
+  return config.tokens.some((grant) => capabilitiesForRole(grant.role).has('term.use'));
 }

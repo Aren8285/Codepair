@@ -1,6 +1,6 @@
-import os from 'node:os';
+import { buildBanner } from './banner.js';
 import { ConfigError, parseConfig } from './config.js';
-import { createAccessUrl, createCodepairServer } from './server.js';
+import { createCodepairServer } from './server.js';
 import { startTunnel, type Tunnel } from './tunnel.js';
 
 const HELP = `CodePair — hybrid local-host collaborative IDE
@@ -19,6 +19,8 @@ Options:
   --viewer-token <token>    Extra token with view-only access
   --allow-origin <origin>   Extra WebSocket origin allowed (repeatable)
   --no-terminal             Disable the remote terminal (explicit opt-out)
+  --rule <glob=access>      Path rule: hidden, r or rw (repeatable, max 50)
+  --confirm-unhide          Let --rule lift a built-in secret default
   --tunnel <provider>       "cloudflare" or "ngrok" public tunnel
   --ice-servers <json>      JSON array of RTCIceServer objects (STUN/TURN)
   --dev-client <url>        Vite dev server origin, used in the printed link
@@ -45,16 +47,13 @@ async function main(): Promise<void> {
     return;
   }
   if (argv.includes('--version')) {
-    process.stdout.write('0.3.1\n');
+    process.stdout.write('0.3.2\n');
     return;
   }
 
   const config = parseConfig(argv);
   const server = await createCodepairServer(config);
   const { port, adminPort } = await server.start();
-
-  const displayHost = config.host === '0.0.0.0' || config.host === '::' ? 'localhost' : config.host;
-  const localBase = config.devClientUrl ?? `http://${formatHost(displayHost)}:${port}`;
 
   let tunnel: Tunnel | undefined;
   if (config.tunnelProvider) {
@@ -69,62 +68,15 @@ async function main(): Promise<void> {
   }
 
   if (!config.quiet) {
-    const lines: string[] = [];
-    lines.push('');
-    lines.push('  \u001b[38;5;39mCodePair\u001b[0m  \u001b[38;5;242mv0.3.1\u001b[0m');
-    lines.push('');
-    lines.push(`  Project   ${server.root}`);
-    // The Host console token is printed exactly once, in this URL fragment.
-    lines.push('');
-    lines.push(`  Host console: \u001b[4mhttp://127.0.0.1:${adminPort}/host#admin=${server.admin.token}\u001b[0m`);
-    lines.push(
-      '  \u001b[38;5;242m(console UI arrives in 0.4; until then use the value after #admin= as a Bearer token)\u001b[0m',
+    process.stdout.write(
+      buildBanner(config, {
+        root: server.root,
+        port,
+        adminPort,
+        adminToken: server.admin.token,
+        tunnelUrl: tunnel?.publicUrl,
+      }),
     );
-    lines.push('');
-    lines.push(`  Room      ${config.roomId}`);
-    lines.push(`  Mode      ${config.tokens[0]?.role === 'viewer' ? 'read-only' : 'read-write'}`);
-    lines.push(
-      `  Terminal  ${
-        config.terminalEnabled
-          ? '\u001b[33menabled\u001b[0m — remote clients with terminal access get a real shell as ' +
-            (process.env.USER ?? 'you')
-          : 'disabled (--no-terminal)'
-      }`,
-    );
-    lines.push('');
-    // One access URL per token, labelled by the role it grants. A raw token is
-    // never printed outside the URL fragment (and only a generated one at all).
-    for (const grant of config.tokens) {
-      const url = createAccessUrl(tunnel?.publicUrl ?? localBase, grant.token, config.roomId);
-      lines.push(`  Open      \u001b[4m${url}\u001b[0m  \u001b[38;5;242m(${grant.role})\u001b[0m`);
-    }
-    lines.push('');
-    if (config.host === '0.0.0.0' || config.host === '::') {
-      const lanPort = config.devClientUrl ? new URL(config.devClientUrl).port || port : port;
-      const lanProtocol = config.devClientUrl?.startsWith('https') ? 'https' : 'http';
-      for (const grant of config.tokens) {
-        for (const url of networkUrls(grant.token, Number(lanPort), config.roomId, lanProtocol)) {
-          lines.push(`  Network   ${url}  \u001b[38;5;242m(${grant.role})\u001b[0m`);
-        }
-      }
-      lines.push('');
-      lines.push('  \u001b[33mAnyone on this network with the link has the access you granted.\u001b[0m');
-      lines.push('  \u001b[33mUse read-only mode for demos; prefer a VPN or trusted LAN.\u001b[0m');
-    } else {
-      lines.push('  Bound to loopback. Use --host 0.0.0.0 to share on your LAN.');
-    }
-    if (tunnel) {
-      lines.push('');
-      for (const grant of config.tokens) {
-        const url = createAccessUrl(tunnel.publicUrl, grant.token, config.roomId);
-        lines.push(`  Public    \u001b[4m${url}\u001b[0m  \u001b[38;5;242m(${grant.role})\u001b[0m`);
-      }
-      lines.push('  \u001b[33mThe tunnel URL is temporary; it disappears when this process stops.\u001b[0m');
-    }
-    lines.push('');
-    lines.push('  Ctrl+C to stop. The token dies with the process.');
-    lines.push('');
-    process.stdout.write(`${lines.join('\n')}\n`);
   }
 
   let shuttingDown = false;
@@ -143,23 +95,6 @@ async function main(): Promise<void> {
   };
   process.once('SIGINT', () => void shutdown('SIGINT'));
   process.once('SIGTERM', () => void shutdown('SIGTERM'));
-}
-
-function networkUrls(token: string, port: number, roomId: string, protocol = 'http'): string[] {
-  const urls: string[] = [];
-  const interfaces = os.networkInterfaces();
-  for (const addresses of Object.values(interfaces)) {
-    for (const address of addresses ?? []) {
-      if (address.family === 'IPv4' && !address.internal) {
-        urls.push(createAccessUrl(`${protocol}://${address.address}:${port}`, token, roomId));
-      }
-    }
-  }
-  return urls;
-}
-
-function formatHost(host: string): string {
-  return host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
 }
 
 main().catch((error: unknown) => {

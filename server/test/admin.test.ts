@@ -311,8 +311,10 @@ describe('admin listener', () => {
 
     expect(routes.map((route) => `${route.methods.join(',')} ${route.path}`).sort()).toEqual([
       'GET /admin/api/fs/list',
+      'GET /admin/api/policy',
       'GET /admin/api/state',
       'POST /admin/api/session/root',
+      'PUT /admin/api/policy/rules',
     ]);
 
     for (const route of routes) {

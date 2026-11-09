@@ -11,7 +11,7 @@ export const CAPABILITIES = [
 
 export type Capability = (typeof CAPABILITIES)[number];
 
-export type Role = 'owner' | 'editor' | 'viewer';
+export type Role = 'owner' | 'editor' | 'viewer' | 'host';
 
 export interface Principal {
   /** Assigned per connection; never shared between requests or sockets. */
@@ -21,9 +21,12 @@ export interface Principal {
 }
 
 export const ROLE_CAPABILITIES: Record<Role, readonly Capability[]> = {
-  owner: ['fs.read', 'fs.write', 'fs.delete', 'term.use', 'call.join', 'session.admin'],
+  // The admin listener's grant is `host`; the owner token is a guest role and
+  // never carries `session.admin`, so holding it grants nothing on that port.
+  owner: ['fs.read', 'fs.write', 'fs.delete', 'term.use', 'call.join'],
   editor: ['fs.read', 'fs.write', 'fs.delete', 'term.use', 'call.join'],
   viewer: ['fs.read', 'call.join'],
+  host: ['session.admin'],
 };
 
 const KNOWN_CAPABILITIES: ReadonlySet<string> = new Set<string>(CAPABILITIES);

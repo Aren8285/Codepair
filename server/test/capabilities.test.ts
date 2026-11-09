@@ -741,6 +741,39 @@ describe('gates that no real role can trip', () => {
   });
 });
 
+  it('refuses a host principal on every guest route', async () => {
+    const { makePrincipal } = await import('../src/security/principal.js');
+    current = await startTestServer({
+      files: { 'a.txt': 'x\n' },
+      authOverride: () => makePrincipal('host'),
+    });
+
+    for (const route of ['/api/tree', '/api/file?path=a.txt', '/api/search?q=a']) {
+      const response = await fetch(`${current.base}${route}`, { headers: { Authorization: 'Bearer anything' } });
+      expect(response.status, route).toBe(403);
+    }
+
+    // `/api/session` is capability-free by design; the host sees only its own grant.
+    const session = await fetch(`${current.base}/api/session`, { headers: { Authorization: 'Bearer anything' } });
+    expect(session.status).toBe(200);
+    expect(((await session.json()) as { capabilities: string[] }).capabilities).toEqual(['session.admin']);
+
+    const opened = await new Promise<boolean>((resolve) => {
+      const socket = new WebSocket(`${current!.wsUrl}?path=a.txt`, ['codepair', 'anything']);
+      const timer = setTimeout(() => resolve(false), 5000);
+      socket.once('open', () => {
+        clearTimeout(timer);
+        socket.terminate();
+        resolve(true);
+      });
+      socket.once('error', () => {
+        clearTimeout(timer);
+        resolve(false);
+      });
+    });
+    expect(opened, 'a host principal may not open documents').toBe(false);
+  });
+
 describe('route audit', () => {
   type RouteLayer = {
     route?: {

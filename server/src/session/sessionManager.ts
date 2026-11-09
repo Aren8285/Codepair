@@ -64,7 +64,9 @@ export class SessionManager {
     }
 
     // 3. Build the replacement first, so a construction failure changes nothing.
-    const next = createSession(canonical, this.options);
+    //    Host rules and the unhide confirmation are per session: a new root
+    //    starts from the built-in defaults only.
+    const next = createSession(canonical, { ...this.options, hostRules: [], confirmUnhide: false });
 
     // 4. Swap atomically: new requests resolve the new session from here on.
     const previous = this.active;
