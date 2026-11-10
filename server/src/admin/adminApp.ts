@@ -4,11 +4,12 @@ import express, { type NextFunction, type Request, type Response } from 'express
 import { AppError, toErrorPayload, unauthorized } from '../errors.js';
 import type { ConnectionRegistry } from '../lobby/connections.js';
 import { DEFAULT_SECRET_RULES, rulesUnhideDefaults, validateRules } from '../security/accessPolicy.js';
-import { tokenFromAuthorizationHeader, type Authenticator } from '../security/auth.js';
+import { tokenFromAuthorizationHeader, type Authenticator, type TokenStore } from '../security/auth.js';
 import { requireCap } from '../security/gate.js';
 import { securityHeaders } from '../security/headers.js';
 import { listHostDirectories } from '../session/hostPaths.js';
 import type { SessionManager } from '../session/sessionManager.js';
+import type { TunnelStatus } from '../tunnelStatus.js';
 
 /** Tags the admin authentication middleware (route audit). */
 export const ADMIN_AUTHENTICATION: unique symbol = Symbol.for('codepair.adminAuthentication');
@@ -35,6 +36,13 @@ export interface AdminAppOptions {
   subscribeEvents: (response: Response) => () => void;
   /** Built client directory; `host.html` is served only from this listener. */
   clientDist: string;
+  /** Guest token grants, for rotation and configured-role display. */
+  tokens: TokenStore;
+  /** Live tunnel snapshot; read at request time. */
+  tunnelStatus: () => TunnelStatus;
+  roomId: string;
+  /** Guest-facing origin used when the console builds an invite link. */
+  guestOrigin: () => string;
   logger?: Pick<Console, 'log' | 'error'>;
 }
 
@@ -109,11 +117,13 @@ export function createAdminApp(options: AdminAppOptions): express.Express {
         rootName: path.basename(session.root) || 'project',
         rootPath: session.root,
         createdAt: session.createdAt,
+        roomId: options.roomId,
       },
       openDocuments: session.documents.openDocuments,
       documentConnections: session.documents.documentConnections,
       terminals: session.terminals.activeSessions,
       terminalBypassesRules: options.terminalBypassesRules(),
+      guestOrigin: options.guestOrigin(),
     });
   });
 
@@ -218,6 +228,64 @@ export function createAdminApp(options: AdminAppOptions): express.Express {
       response.status(204).end();
     },
   );
+
+  app.get('/admin/api/invites', requireCap('session.admin'), (_request, response) => {
+    response.json({ invites: options.sessions.current().invites.list() });
+  });
+
+  app.post('/admin/api/invites', requireCap('session.admin'), (request, response) => {
+    const body = asRecord(request.body);
+    const role = body.role;
+    if (role !== 'editor' && role !== 'viewer') {
+      throw new AppError(400, 'BAD_REQUEST', 'An invite can only grant editor or viewer access; owner is never allowed.');
+    }
+    const ttlMinutes = body.ttlMinutes;
+    if (ttlMinutes !== undefined && ttlMinutes !== null && typeof ttlMinutes !== 'number') {
+      throw new AppError(400, 'BAD_REQUEST', '"ttlMinutes" must be a number or null.');
+    }
+    const maxUses = body.maxUses;
+    if (maxUses !== undefined && maxUses !== null && typeof maxUses !== 'number') {
+      throw new AppError(400, 'BAD_REQUEST', '"maxUses" must be a number or null.');
+    }
+    response.status(201).json({
+      invite: options.sessions.current().invites.create({
+        role,
+        ttlMinutes: ttlMinutes ?? null,
+        maxUses: maxUses ?? null,
+      }),
+    });
+  });
+
+  app.post('/admin/api/invites/:id/revoke', requireCap('session.admin'), (request, response) => {
+    const id = request.params.id;
+    if (!id) throw new AppError(400, 'BAD_REQUEST', 'An invite id is required.');
+    response.json({ invite: options.sessions.current().invites.revoke(id) });
+  });
+
+  app.get('/admin/api/tokens', requireCap('session.admin'), (_request, response) => {
+    const roles = ['owner', 'editor', 'viewer'] as const;
+    response.json({
+      roles: roles.map((role) => ({ role, configured: options.tokens.tokenFor(role) !== undefined })),
+    });
+  });
+
+  app.post('/admin/api/tokens/:role/rotate', requireCap('session.admin'), (request, response) => {
+    const role = request.params.role;
+    if (role !== 'owner' && role !== 'editor' && role !== 'viewer') {
+      throw new AppError(400, 'BAD_REQUEST', '"role" must be owner, editor or viewer.');
+    }
+    const token = options.tokens.rotate(role);
+    if (!token) {
+      throw new AppError(404, 'TOKEN_NOT_CONFIGURED', `No ${role} token is configured on this host.`);
+    }
+    // A rotated role's invites are destroyed, not transferred to the new token.
+    if (role !== 'owner') options.sessions.current().invites.revokeForRole(role);
+    response.json({ role, token });
+  });
+
+  app.get('/admin/api/tunnel', requireCap('session.admin'), (_request, response) => {
+    response.json(options.tunnelStatus());
+  });
 
   app.post(
     '/admin/api/session/root',

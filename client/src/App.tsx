@@ -1,7 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ApiClient, ApiError, describeApiError, type FileEntry, type LobbyStatus, type SessionInfo } from './lib/api';
+import {
+  ApiClient,
+  ApiError,
+  describeApiError,
+  redeemInvite,
+  type FileEntry,
+  type LobbyStatus,
+  type SessionInfo,
+} from './lib/api';
 import { baseName, languageForPath, parentDirectory } from './lib/language';
-import { clearStoredToken, loadToken, roomFromPath, storeToken } from './lib/token';
+import { clearInviteHash, clearStoredToken, inviteFromHash, loadToken, roomFromPath, storeToken } from './lib/token';
 import { rotateConnectionId } from './lib/connection';
 import { currentPresence } from './lib/presence';
 import { exportEditorFile } from './lib/download';
@@ -31,6 +39,24 @@ import { Icon, PairMark } from './components/Icon';
 
 type SessionState = 'idle' | 'loading' | 'ready' | 'error';
 type LobbyView = LobbyGateView | 'admitted';
+type InviteState = 'idle' | 'redeeming' | 'error';
+
+/**
+ * StrictMode mounts App twice in development. Keep one redemption promise per
+ * invite for the tab's lifetime so a maxUses:1 link cannot be consumed twice.
+ */
+const inviteRedemptions = new Map<string, Promise<{ token: string; role: 'editor' | 'viewer' }>>();
+
+function redeemInviteOnce(id: string): Promise<{ token: string; role: 'editor' | 'viewer' }> {
+  const existing = inviteRedemptions.get(id);
+  if (existing) return existing;
+  const pending = redeemInvite(id).catch((error: unknown) => {
+    inviteRedemptions.delete(id);
+    throw error;
+  });
+  inviteRedemptions.set(id, pending);
+  return pending;
+}
 
 type ModalState =
   | { kind: 'share' }
@@ -43,7 +69,11 @@ type ModalState =
   | null;
 
 export function App() {
-  const [token, setToken] = useState<string | null>(() => loadToken());
+  const [inviteId, setInviteId] = useState<string | null>(() => inviteFromHash());
+  const [inviteState, setInviteState] = useState<InviteState>(() => (inviteFromHash() ? 'redeeming' : 'idle'));
+  const [inviteError, setInviteError] = useState('');
+  const [inviteAttempt, setInviteAttempt] = useState(0);
+  const [token, setToken] = useState<string | null>(() => (inviteFromHash() ? null : loadToken()));
   const [session, setSession] = useState<SessionInfo | null>(null);
   const [sessionState, setSessionState] = useState<SessionState>('idle');
   const [sessionError, setSessionError] = useState('');
@@ -52,6 +82,30 @@ export function App() {
   const [routeRoom, setRouteRoom] = useState<string | null>(() => roomFromPath(window.location.pathname));
   const [malformedRoom] = useState(() => window.location.pathname.startsWith('/room/') && roomFromPath(window.location.pathname) === null);
   const api = useMemo(() => (token ? new ApiClient(token) : null), [token]);
+
+  useEffect(() => {
+    if (!inviteId) return;
+    let cancelled = false;
+    setInviteState('redeeming');
+    setInviteError('');
+    redeemInviteOnce(inviteId)
+      .then(({ token: nextToken }) => {
+        if (cancelled) return;
+        storeToken(nextToken);
+        clearInviteHash();
+        setToken(nextToken);
+        setInviteId(null);
+        setInviteState('idle');
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return;
+        setInviteError(describeApiError(error));
+        setInviteState('error');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [inviteId, inviteAttempt]);
 
   // Admission state. `checking` is the moment between "token accepted" and the
   // Host's answer; `admitted` is the only view that renders the workspace.
@@ -210,6 +264,28 @@ export function App() {
     setRouteRoom(null);
     window.history.replaceState(null, '', '/');
   }, []);
+
+  if (inviteState === 'redeeming') {
+    return <BootScreen />;
+  }
+
+  if (inviteState === 'error') {
+    return (
+      <LobbyScreen
+        view="invite"
+        rootName="CodePair"
+        displayName={currentPresence().name}
+        message={inviteError}
+        onRetry={() => setInviteAttempt((value) => value + 1)}
+        onLeave={() => {
+          clearInviteHash();
+          setInviteId(null);
+          setInviteState('idle');
+          setInviteError('');
+        }}
+      />
+    );
+  }
 
   if (!token) {
     return <TokenGate onConnect={connect} error={authError} />;

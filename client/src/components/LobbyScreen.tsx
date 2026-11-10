@@ -1,7 +1,7 @@
 import type { ReactNode } from 'react';
 import { Icon, PairMark } from './Icon';
 
-export type LobbyGateView = 'checking' | 'waiting' | 'denied' | 'expired' | 'removed' | 'locked' | 'full';
+export type LobbyGateView = 'checking' | 'waiting' | 'denied' | 'expired' | 'removed' | 'locked' | 'full' | 'invite';
 
 interface LobbyScreenProps {
   view: LobbyGateView;
@@ -56,14 +56,21 @@ const COPY: Record<Exclude<LobbyGateView, 'checking'>, Copy> = {
     body: 'Fifty requests are already waiting. Try again in a moment; the host has to clear some first.',
     tone: 'warning',
   },
+  invite: {
+    eyebrow: 'Invite unavailable',
+    title: 'This invite link can’t be used.',
+    body: 'It may have expired, reached its use limit, or been revoked. Ask the host for a fresh invite link.',
+    tone: 'error',
+  },
 };
 
-const PRIMARY: Record<'denied' | 'removed' | 'expired' | 'locked' | 'full', { label: string; fresh: boolean }> = {
+const PRIMARY: Record<'denied' | 'removed' | 'expired' | 'locked' | 'full' | 'invite', { label: string; fresh: boolean }> = {
   denied: { label: 'Ask again as a new tab', fresh: true },
   removed: { label: 'Ask to join again', fresh: true },
   expired: { label: 'Try again', fresh: false },
   locked: { label: 'Try again', fresh: false },
   full: { label: 'Try again', fresh: false },
+  invite: { label: 'Try this link again', fresh: false },
 };
 
 /** Full-page gate between "token accepted" and "the workspace". */

@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
+import os from 'node:os';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { createAdminApp } from './admin/adminApp.js';
@@ -26,6 +27,7 @@ import {
   tokenFromAuthorizationHeader,
   tokenFromWebSocketHeader,
   type Authenticator,
+  TokenStore,
 } from './security/auth.js';
 import { CAPABILITY_GATE, requireCap } from './security/gate.js';
 import { securityHeaders } from './security/headers.js';
@@ -34,11 +36,12 @@ import { SandboxError, type PathGuard } from './security/pathGuard.js';
 import type { Session } from './session/session.js';
 import { SessionManager } from './session/sessionManager.js';
 import { SignalingHub } from './signaling/signalingHub.js';
+import { createTunnelState, type TunnelStatus } from './tunnelStatus.js';
 
 export { CAPABILITY_GATE, requireCap };
 export type { CapabilityGate } from './security/gate.js';
 
-export const SERVER_VERSION = '0.4.0';
+export const SERVER_VERSION = '0.5.0';
 const MAX_WS_PAYLOAD = 2 * 1024 * 1024;
 
 /** Tags the `/api` authentication middleware (route audit). */
@@ -71,6 +74,10 @@ export interface CreateServerOptions {
    * authenticator from the configured tokens.
    */
   authenticate?: Authenticator;
+  /** Test seam: snapshot source for the admin tunnel status. */
+  tunnelStatus?: () => TunnelStatus;
+  /** Test seam: clock used by the session's invite store. */
+  inviteNow?: () => number;
 }
 
 export async function createCodepairServer(
@@ -115,18 +122,31 @@ export async function createCodepairServer(
 
   // The one active session. `config.root` is read exactly here and nowhere else
   // in the server; every request resolves the session it will use, once.
+  const tokenStore = new TokenStore(config.tokens);
   const sessions = new SessionManager(config.root, {
     saveDebounceMs: config.saveDebounceMs,
     maxFileBytes: config.maxFileBytes,
     terminalEnabled: config.terminalEnabled,
     ignored,
     lobby: { enabled: config.lobbyEnabled, timeoutMs: config.lobbyTimeoutMs, onChange: broadcastLobby },
+    inviteTokens: tokenStore,
+    inviteNow: options.inviteNow,
   });
 
   // Signalling is session-independent: rooms are stable for the daemon's life.
   const signaling = new SignalingHub({ room: config.roomId });
 
-  const authenticate = options.authenticate ?? createAuthenticator(config.tokens);
+  const authenticate = options.authenticate ?? tokenStore.authenticate;
+  const tunnelState = createTunnelState(config.tunnelProvider);
+  const tunnelStatus = options.tunnelStatus ?? (() => tunnelState.status());
+  let boundPort = config.port;
+  const guestOrigin = (): string => {
+    const publicUrl = tunnelStatus().publicUrl;
+    if (publicUrl) return publicUrl.replace(/\/+$/, '');
+    const host = config.host === '0.0.0.0' || config.host === '::' ? firstLanAddress() ?? '127.0.0.1' : config.host;
+    const formatted = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
+    return `http://${formatted}:${boundPort}`;
+  };
 
   // The Host console gets its own authenticator, built from one grant, and that
   // instance is passed only to the admin app. Guest grants are never registered
@@ -143,6 +163,10 @@ export async function createCodepairServer(
     connections,
     subscribeEvents,
     clientDist: config.clientDist,
+    tokens: tokenStore,
+    tunnelStatus,
+    roomId: config.roomId,
+    guestOrigin,
   });
   const adminHttpServer = http.createServer(adminApp);
 
@@ -154,6 +178,18 @@ export async function createCodepairServer(
 
   app.get('/api/health', (_request, response) => {
     response.json({ ok: true, version: SERVER_VERSION });
+  });
+
+  // Invite redemption is the one intentionally unauthenticated API route: the
+  // whole point is to exchange a link for a token. It is rate-limited and
+  // fail-closed inside InviteStore, and it grants no access by itself.
+  app.post('/api/invites/:id/redeem', (request, response, next) => {
+    response.setHeader('Cache-Control', 'no-store');
+    try {
+      response.json(sessions.current().invites.redeem(request.params.id));
+    } catch (error) {
+      next(error);
+    }
   });
 
   // Tagged so the route-audit test can prove every `/api` route still sits
@@ -583,6 +619,7 @@ export async function createCodepairServer(
       if (listening) throw new ConfigError('Server is already listening.');
 
       const actualPort = await listen(httpServer, port, host);
+      boundPort = actualPort;
 
       try {
         // 127.0.0.1 as a literal, never `config.host`: the Host console is
@@ -657,6 +694,15 @@ function isLocalOrPrivateHost(hostname: string): boolean {
   if (/^192\.168\./.test(hostname)) return true;
   if (/^172\.(1[6-9]|2\d|3[01])\./.test(hostname)) return true;
   return false;
+}
+
+function firstLanAddress(): string | undefined {
+  for (const entries of Object.values(os.networkInterfaces())) {
+    for (const entry of entries ?? []) {
+      if (entry.family === 'IPv4' && !entry.internal) return entry.address;
+    }
+  }
+  return undefined;
 }
 
 /** Is this session still the active one? Never throws during shutdown. */

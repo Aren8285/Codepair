@@ -1,4 +1,4 @@
-import { createHash, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
 import { makePrincipal, type Principal, type Role } from './principal.js';
 
@@ -39,6 +39,53 @@ export function createAuthenticator(
     }
     return matched === undefined ? null : makePrincipal(matched);
   };
+}
+
+export function generateAccessToken(): string {
+  return randomBytes(32).toString('base64url');
+}
+
+/**
+ * Mutable token grants for the lifetime of the daemon. Rotation swaps every
+ * grant for one role and rebuilds the authenticator, so new requests reject
+ * the old token immediately; sockets already upgraded never re-authenticate.
+ */
+export class TokenStore {
+  private grants: TokenGrant[];
+  private authenticator: Authenticator;
+
+  constructor(
+    grants: readonly TokenGrant[],
+    private readonly generate: () => string = generateAccessToken,
+  ) {
+    this.grants = grants.map((grant) => ({ ...grant }));
+    this.authenticator = createAuthenticator(this.grants);
+  }
+
+  readonly authenticate = (rawToken: string | undefined | null): Principal | null =>
+    this.authenticator(rawToken);
+
+  roles(): Role[] {
+    return [...new Set(this.grants.map((grant) => grant.role))];
+  }
+
+  tokenFor(role: Role): string | undefined {
+    return this.grants.find((grant) => grant.role === role)?.token;
+  }
+
+  /** Replace every grant for `role`; null when that role was never configured. */
+  rotate(role: Role): string | null {
+    if (!this.grants.some((grant) => grant.role === role)) return null;
+
+    let next = this.generate();
+    for (let attempt = 0; attempt < 16 && this.grants.some((grant) => grant.token === next); attempt += 1) {
+      next = this.generate();
+    }
+
+    this.grants = [...this.grants.filter((grant) => grant.role !== role), { token: next, role }];
+    this.authenticator = createAuthenticator(this.grants);
+    return next;
+  }
 }
 
 export function tokenFromAuthorizationHeader(header: string | undefined): string | undefined {

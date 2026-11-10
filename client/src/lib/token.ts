@@ -1,5 +1,6 @@
 const STORAGE_KEY = 'codepair.token';
 const TOKEN_PATTERN = /^[A-Za-z0-9._~-]{16,512}$/;
+const INVITE_PATTERN = /^[A-Za-z0-9_-]{16,128}$/;
 
 /** Read the token from `#token=` (stripping it from the address bar) or sessionStorage. */
 export function loadToken(): string | null {
@@ -28,6 +29,22 @@ export function clearStoredToken(): void {
 export function buildShareUrl(token: string, roomId?: string): string {
   const path = roomId ? `/room/${encodeURIComponent(roomId)}` : '/';
   return `${window.location.origin}${path}#token=${encodeURIComponent(token)}`;
+}
+
+/** Read `#invite=` without stripping it: a failed redeem must keep the link. */
+export function inviteFromHash(): string | null {
+  const hash = window.location.hash;
+  if (!hash.startsWith('#invite=')) return null;
+  const id = decodeURIComponent(hash.slice('#invite='.length));
+  return INVITE_PATTERN.test(id) ? id : null;
+}
+
+export function clearInviteHash(): void {
+  window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`);
+}
+
+export function buildInviteUrl(origin: string, roomId: string, inviteId: string): string {
+  return `${origin.replace(/\/+$/, '')}/room/${encodeURIComponent(roomId)}#invite=${encodeURIComponent(inviteId)}`;
 }
 
 /** Accepts a raw token, a full access URL, or a room link with a token hash. */

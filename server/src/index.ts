@@ -2,6 +2,7 @@ import { buildBanner } from './banner.js';
 import { ConfigError, parseConfig } from './config.js';
 import { createCodepairServer } from './server.js';
 import { startTunnel, type Tunnel } from './tunnel.js';
+import { createTunnelState, detectCloudflaredInstalled } from './tunnelStatus.js';
 
 const HELP = `CodePair — hybrid local-host collaborative IDE
 
@@ -49,19 +50,22 @@ async function main(): Promise<void> {
     return;
   }
   if (argv.includes('--version')) {
-    process.stdout.write('0.4.0\n');
+    process.stdout.write('0.5.0\n');
     return;
   }
 
   const config = parseConfig(argv);
-  const server = await createCodepairServer(config);
+  const tunnelState = createTunnelState(config.tunnelProvider, () => detectCloudflaredInstalled());
+  const server = await createCodepairServer(config, { tunnelStatus: () => tunnelState.status() });
   const { port, adminPort } = await server.start();
 
   let tunnel: Tunnel | undefined;
   if (config.tunnelProvider) {
     try {
       tunnel = await startTunnel(config.tunnelProvider, port);
+      tunnelState.setPublicUrl(tunnel.publicUrl);
     } catch (error) {
+      tunnelState.setPublicUrl(null);
       console.error(
         `\n  [codepair] Public tunnel unavailable: ${error instanceof Error ? error.message : String(error)}\n` +
           '  The Host is still reachable on the LAN only.\n',
@@ -88,6 +92,7 @@ async function main(): Promise<void> {
     if (!config.quiet) process.stdout.write(`\n  ${signal}: saving open files and shutting down…\n`);
     try {
       await tunnel?.stop();
+      tunnelState.setPublicUrl(null);
       await server.close();
       process.exit(0);
     } catch (error) {

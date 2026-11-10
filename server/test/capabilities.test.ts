@@ -818,12 +818,18 @@ describe('route audit', () => {
       'GET /api/tree',
       'POST /api/files',
       'POST /api/files/rename',
+      'POST /api/invites/:id/redeem',
       'POST /api/lobby/join',
     ]);
 
     for (const route of routes) {
       if (route.path === '/api/health') {
         expect(route.gate, '/api/health stays public').toBeUndefined();
+        continue;
+      }
+      if (route.path === '/api/invites/:id/redeem') {
+        // Deliberately public: this is the link-to-token exchange itself.
+        expect(route.gate, 'invite redemption is public by design').toBeUndefined();
         continue;
       }
       if (route.path === '/api/session') {

@@ -41,9 +41,17 @@ Host machine                                    Remote clients
 - **Join approval (lobby)** — every guest token waits in a queue until the Host admits it
   as editor or viewer, denies it, or lets it expire; the Host can lock the room and kick a
   tab at any moment. `--no-lobby` restores the old "open the link and you are in" flow.
+- **Expiring invite links and live token rotation** — the Host console mints expiring,
+  limited-use editor/viewer links; each redemption becomes a real token and still waits in
+  the lobby. Rotating a role revokes that role's pending invites and stops its old token
+  for new connections, while existing sockets keep working.
+- **Tunnel status at a glance** — the Host console reports whether a tunnel is configured
+  and running, shows the public URL with a QR code when live, and says whether
+  `cloudflared` is installed. It never downloads or executes a fetched binary.
 - **Loopback Host console** — a separate admin listener (own token, its own port) serves
-  `/host`: a live queue over SSE, admit/deny, kick and room lock, plus the project switch
-  and live rule editor. None of it exists on the guest port.
+  `/host`: a scrollable control room with the live queue over SSE, admit/deny, kick and room
+  lock, project switch, live rule editor, invite links, role-token rotation and tunnel
+  status. None of it exists on the guest port.
 - **Token auth everywhere** — a random 256-bit token per start, checked on every HTTP
   route and every WebSocket upgrade; the token travels in the URL fragment, never in
   query strings or logs.
@@ -237,7 +245,36 @@ guest port (the guest app answers `/admin/*` with a 404).
 | `POST /admin/api/lobby/:id/deny` | refuses one pending request; that connection becomes terminal |
 | `POST /admin/api/lobby/lock` | `{ "locked": true \| false }` → refuse or resume new joins |
 | `POST /admin/api/connections/:connectionId/kick` | closes that tab's doc/terminal/signal sockets with `4429` and makes its request terminal |
+| `GET /admin/api/invites` | live and exhausted invites, with role, expiry, `maxUses` and `usedCount` |
+| `POST /admin/api/invites` | `{ "role": "editor\|viewer", "ttlMinutes": 5\|null, "maxUses": 1\|null }` → mints a 144-bit invite id |
+| `POST /admin/api/invites/:id/revoke` | revokes one invite; redeeming it then fails closed |
+| `GET /admin/api/tokens` | which roles (`owner`, `editor`, `viewer`) have a token configured |
+| `POST /admin/api/tokens/:role/rotate` | returns a new token once; old token fails new requests, the role's live invites are revoked, existing sockets continue |
+| `GET /admin/api/tunnel` | `configured`, `provider`, `running`, `publicUrl`, `cloudflaredInstalled`, `installInstructions` |
 | `GET /admin/api/events?token=…` | SSE: an opening `snapshot` event, then `lobby` on every change, with a 15 s heartbeat |
+
+### Invite links and token rotation
+
+The invite link is built from the guest origin (`http://127.0.0.1:<port>/room/<id>#invite=<id>`)
+and redeems through the one intentionally unauthenticated API route,
+`POST /api/invites/:id/redeem`. Redemption returns `{ token, role }` and grants no seat by
+itself: the new token still enters the normal lobby. Invite ids are 18 random bytes
+(144 bits), URLs stay in the fragment, and the client redeems each id at most once per
+tab even under React StrictMode.
+
+- A role with no configured token cannot mint an invite (`409 ROLE_NOT_CONFIGURED`); owner
+  invites are refused.
+- At most 50 live invites exist per session (`429 INVITE_LIMIT`); TTL is at most seven
+  days and `maxUses` at most 1000.
+- Ten failed redeems against one id in a rolling 60 s window block that id for 60 s
+  (`429 INVITE_RATE_LIMITED`). The failure tracker is capped at 256 ids; blocked entries
+  are never evicted, and a fresh id is still tracked when every slot is blocked (a
+  deliberate soft cap). `usedCount` increments only on a successful redeem.
+- Unknown, expired, exhausted and revoked invites all return the same byte-identical
+  `404 INVITE_INVALID` body.
+- Rotation returns the new token once in the Host console. It replaces the old token for
+  new HTTP requests and WebSocket upgrades, revokes every live invite for that role, and
+  leaves already-open sockets alone.
 
 Switching validates the path first, builds the new session before touching the old one, swaps
 atomically, then disposes the old one: dirty documents are flushed to their **old** absolute
@@ -307,8 +344,9 @@ slides up as an overlay.
    enough: it must also be admitted by the Host unless the daemon runs with `--no-lobby`,
    and the seat can only narrow that role. `owner` and `editor` may edit and, unless
    `--no-terminal`, run commands as the Host user; `viewer` may only read. Share tokens out
-   of band; rotate by restarting the daemon (or passing different `--token` values). The
-   client drops the stored token on a 401.
+   of band. Rotate a role in the Host console: new HTTP/WebSocket connections must use the
+   new token, the old one answers 401, pending invites for that role are revoked, and
+   already-open sockets keep working. The client drops a stored token on a 401.
 2. **HTTP auth**: every `/api/*` route except `/api/health` requires
    `Authorization: Bearer <token>`; comparison hashes both sides with SHA-256 and uses
    `timingSafeEqual`.
@@ -357,7 +395,10 @@ CODE_PAIR_ICE_SERVERS='[
 ```
 
 - **Public tunnels require the provider CLI** (`cloudflared` or `ngrok`) to be installed
-  and are not permanent — the URL dies with the process.
+  and are not permanent — the URL dies with the process. The Host console detects an
+  installed `cloudflared`, shows the configured/running state and a QR for a live public
+  URL, and prints provider instructions; CodePair never downloads or executes a fetched
+  binary.
 - **Windows is unverified**: symlink checks and shell rc generation are written for POSIX
   shells.
 - **Access-policy limits**: hidden means hidden from the app, not from a shell (the
@@ -370,9 +411,11 @@ CODE_PAIR_ICE_SERVERS='[
 
 ## Testing
 
-Currently 183 server tests (12 files) and 24 browser checks. The join lobby and Host
+Currently 206 server tests (13 files) and 28 browser checks. The join lobby and Host
 console were also exercised with a temporary headless-Chrome flow (waiting room → admit →
-workspace → kick → removed screen → lock → locked screen), which is not committed.
+workspace → kick → removed screen → lock → locked screen), which is not committed. The
+committed browser run also covers invite creation, one-use redemption, lobby admission,
+`usedCount = 1`, and refusal to reuse the link.
 
 ```bash
 npm run typecheck     # tsc for server + client
@@ -393,8 +436,8 @@ node probe.mjs                 # geometry dump at small viewports (diagnostic)
 ```
 
 `browser.mjs` exercises file loading, concurrent edits converging, presence, remote
-cursors, a real shell, 401s, path-traversal rejection, the Share QR code and the mobile
-layout. `devices.mjs` checks overflow, off-screen controls and tap-target sizes across
+cursors, a real shell, 401s, path-traversal rejection, the Share QR code, the mobile
+layout, and one-use invite redemption under StrictMode. `devices.mjs` checks overflow, off-screen controls and tap-target sizes across
 11 viewports.
 
 ## Platform notes

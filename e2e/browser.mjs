@@ -360,6 +360,83 @@ try {
     );
     check('a reload after a switch shows the new project', reloaded.includes('b.md'), JSON.stringify(reloaded));
 
+    // 25-27. Invite links: one-use editor invite, redeem, lobby-admit, reuse refusal.
+    const adminHeaders = {
+      Authorization: `Bearer ${adminToken}`,
+      'Content-Type': 'application/json',
+    };
+    const adminState = await fetch(`${adminBase}/admin/api/state`, {
+      headers: { Authorization: `Bearer ${adminToken}` },
+    }).then((response) => response.json());
+    const inviteCreated = await fetch(`${adminBase}/admin/api/invites`, {
+      method: 'POST',
+      headers: adminHeaders,
+      body: JSON.stringify({ role: 'editor', ttlMinutes: 5, maxUses: 1 }),
+    });
+    const inviteBody = await inviteCreated.json();
+    const inviteId = inviteBody.invite?.id;
+    check(
+      'the Host can create a one-use invite link',
+      inviteCreated.status === 201 && typeof inviteId === 'string',
+      JSON.stringify(inviteBody).slice(0, 160),
+    );
+
+    const inviteUrl = `${BASE}/room/${encodeURIComponent(adminState.session.roomId)}#invite=${encodeURIComponent(inviteId)}`;
+    const inviteContext = await browser.createBrowserContext();
+    const invitePage = await inviteContext.newPage();
+    try {
+      await invitePage.goto(inviteUrl, { waitUntil: 'domcontentloaded' });
+      const waiting = await invitePage
+        .waitForSelector('.lobby--waiting', { timeout: 20000 })
+        .then(() => true)
+        .catch(() => false);
+      const hashCleared = await invitePage.evaluate(() => !window.location.hash.includes('invite='));
+
+      const lobby = await fetch(`${adminBase}/admin/api/lobby`, {
+        headers: { Authorization: `Bearer ${adminToken}` },
+      }).then((response) => response.json());
+      const pending = lobby.pending[lobby.pending.length - 1];
+      const admitted = pending
+        ? await fetch(`${adminBase}/admin/api/lobby/${encodeURIComponent(pending.id)}/admit`, {
+            method: 'POST',
+            headers: adminHeaders,
+            body: JSON.stringify({ role: 'editor' }),
+          })
+        : null;
+      const inWorkspace = await invitePage
+        .waitForSelector('.app', { timeout: 20000 })
+        .then(() => true)
+        .catch(() => false);
+
+      const listed = await fetch(`${adminBase}/admin/api/invites`, {
+        headers: { Authorization: `Bearer ${adminToken}` },
+      }).then((response) => response.json());
+      const used = listed.invites.find((invite) => invite.id === inviteId)?.usedCount;
+
+      check(
+        'a one-use invite redeems, enters the lobby, and is admitted',
+        waiting && hashCleared && admitted?.status === 200 && inWorkspace,
+        JSON.stringify({ waiting, hashCleared, admit: admitted?.status, inWorkspace }),
+      );
+      check('one redemption records exactly one use', used === 1, `usedCount=${used}`);
+
+      const reuseContext = await browser.createBrowserContext();
+      const reusePage = await reuseContext.newPage();
+      try {
+        await reusePage.goto(inviteUrl, { waitUntil: 'domcontentloaded' });
+        const refused = await reusePage
+          .waitForSelector('.lobby--invite', { timeout: 20000 })
+          .then(() => true)
+          .catch(() => false);
+        const title = await reusePage.evaluate(() => document.querySelector('.lobby__title')?.textContent ?? '');
+        check('reusing the one-use invite is refused with the invite error screen', refused, title);
+      } finally {
+        await reuseContext.close();
+      }
+    } finally {
+      await inviteContext.close();
+    }
+
     await fs.rm(SECOND_FILE, { force: true });
     await fs.rm(rootA, { recursive: true, force: true });
     await fs.rm(rootB, { recursive: true, force: true });

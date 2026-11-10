@@ -1,21 +1,41 @@
-import { useCallback, useEffect, useMemo, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import type { LobbyEntry, LobbySnapshot } from '../lib/api';
 import { Icon, PairMark } from '../components/Icon';
-import { HostApi, HostApiError, type HostSessionState } from './hostApi';
+import { buildInviteUrl } from '../lib/token';
+import { HostQr } from './HostQr';
+import {
+  HostApi,
+  HostApiError,
+  type HostInvite,
+  type HostSessionState,
+  type HostTokenRole,
+  type HostTunnelStatus,
+} from './hostApi';
 import { clearHostToken, loadHostToken, parseHostToken, storeHostToken } from './token';
 
 type StreamState = 'connecting' | 'live' | 'reconnecting';
+const ROLES = ['owner', 'editor', 'viewer'] as const;
 
 /** Above this many waiting cards the list scrolls instead of the page. */
 export function HostApp() {
   const [token, setToken] = useState<string | null>(() => loadHostToken());
   const [snapshot, setSnapshot] = useState<LobbySnapshot | null>(null);
   const [info, setInfo] = useState<HostSessionState | null>(null);
+  const [invites, setInvites] = useState<HostInvite[]>([]);
+  const [tokenRoles, setTokenRoles] = useState<HostTokenRole[]>([]);
+  const [tunnel, setTunnel] = useState<HostTunnelStatus | null>(null);
   const [stream, setStream] = useState<StreamState>('connecting');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState<string | null>(null);
   const [kickArm, setKickArm] = useState<string | null>(null);
   const [now, setNow] = useState(() => Date.now());
+  const [inviteRole, setInviteRole] = useState<'editor' | 'viewer'>('editor');
+  const [inviteTtl, setInviteTtl] = useState('');
+  const [inviteMaxUses, setInviteMaxUses] = useState('');
+  const [inviteLink, setInviteLink] = useState('');
+  const [rotated, setRotated] = useState<Partial<Record<(typeof ROLES)[number], string>>>({});
+  const [copied, setCopied] = useState<string | null>(null);
+  const copiedTimer = useRef<number | undefined>(undefined);
   const api = useMemo(() => (token ? new HostApi(token) : null), [token]);
 
   useEffect(() => {
@@ -28,6 +48,8 @@ export function HostApp() {
     const timer = window.setTimeout(() => setKickArm(null), 4000);
     return () => window.clearTimeout(timer);
   }, [kickArm]);
+
+  useEffect(() => () => window.clearTimeout(copiedTimer.current), []);
 
   const fail = useCallback((caught: unknown) => {
     if (caught instanceof HostApiError && caught.status === 401) {
@@ -43,9 +65,18 @@ export function HostApp() {
 
   const refresh = useCallback(async () => {
     if (!api) return;
-    const [nextSnapshot, nextInfo] = await Promise.all([api.snapshot(), api.sessionState()]);
+    const [nextSnapshot, nextInfo, nextInvites, nextRoles, nextTunnel] = await Promise.all([
+      api.snapshot(),
+      api.sessionState(),
+      api.invites(),
+      api.tokenRoles(),
+      api.tunnel(),
+    ]);
     setSnapshot(nextSnapshot);
     setInfo(nextInfo);
+    setInvites(nextInvites.invites);
+    setTokenRoles(nextRoles.roles);
+    setTunnel(nextTunnel);
   }, [api]);
 
   useEffect(() => {
@@ -129,6 +160,61 @@ export function HostApp() {
     });
   };
 
+  const copyText = async (key: string, value: string) => {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopied(key);
+      window.clearTimeout(copiedTimer.current);
+      copiedTimer.current = window.setTimeout(() => setCopied(null), 2000);
+    } catch {
+      setError('Could not copy to the clipboard. Select the text and copy it manually.');
+    }
+  };
+
+  const createInvite = (event: FormEvent) => {
+    event.preventDefault();
+    if (!api) return;
+    const ttl = inviteTtl.trim() === '' ? null : Number(inviteTtl);
+    const maxUses = inviteMaxUses.trim() === '' ? null : Number(inviteMaxUses);
+    if ((ttl !== null && (!Number.isInteger(ttl) || ttl < 1)) || (maxUses !== null && (!Number.isInteger(maxUses) || maxUses < 1))) {
+      setError('TTL and max uses must be positive whole numbers, or left blank.');
+      return;
+    }
+    void act('invite:create', async () => {
+      const result = await api.createInvite({ role: inviteRole, ttlMinutes: ttl, maxUses });
+      if (info) {
+        setInviteLink(buildInviteUrl(info.guestOrigin, info.session.roomId, result.invite.id));
+      }
+      await refresh();
+    });
+  };
+
+  const revokeInvite = (invite: HostInvite) => {
+    if (!api) return;
+    void act(`invite:revoke:${invite.id}`, async () => {
+      await api.revokeInvite(invite.id);
+      setInviteLink((current) => (current.includes(invite.id) ? '' : current));
+      await refresh();
+    });
+  };
+
+  const rotate = (role: (typeof ROLES)[number]) => {
+    if (!api) return;
+    const count = invites.filter((invite) => invite.role === role).length;
+    const message =
+      `Rotating the ${role} token invalidates the old token for new connections. ` +
+      `This will also revoke ${count} pending invite(s) for this role. ` +
+      'Existing connections keep working.';
+    if (!window.confirm(message)) return;
+    void act(`rotate:${role}`, async () => {
+      const result = await api.rotateToken(role);
+      const revokedIds = invites.filter((invite) => invite.role === role).map((invite) => invite.id);
+      setInviteLink((current) => (revokedIds.some((id) => current.includes(id)) ? '' : current));
+      setRotated((previous) => ({ ...previous, [role]: result.token }));
+      await refresh();
+    });
+  };
+
   const connect = (next: string) => {
     storeHostToken(next);
     setError('');
@@ -164,6 +250,9 @@ export function HostApp() {
 
   return (
     <div className="host">
+      <a className="host__skip" href="#host-main">
+        Skip to room controls
+      </a>
       <header className="host__bar">
         <div className="host__brand">
           <span className="host__brand-mark">
@@ -216,18 +305,21 @@ export function HostApp() {
         </p>
       ) : null}
 
-      <main className="host__grid">
+      <main className="host__main" id="host-main">
+        <div className="host__grid">
         <section className="host__col" aria-labelledby="host-pending">
           <div className="host__col-head">
-            <h2 id="host-pending">Waiting</h2>
+            <h2 id="host-pending">Waiting room</h2>
             <span className={`host__count${waiting.length > 0 ? ' host__count--hot' : ''}`}>{waiting.length}</span>
           </div>
           {waiting.length === 0 ? (
             <div className="host__empty">
-              <p className="host__empty-title">Nobody is waiting.</p>
+              <span className="host__empty-icon" aria-hidden="true">
+                <Icon name="users" size={18} />
+              </span>
+              <p className="host__empty-title">No one is waiting.</p>
               <p className="host__empty-text">
-                Share the room link. A guest appears here with the name their tab chose, and stays out until you admit
-                them.
+                Share a link. A guest appears here with the name their tab chose and stays out until you admit them.
               </p>
             </div>
           ) : (
@@ -290,13 +382,18 @@ export function HostApp() {
 
         <section className="host__col host__col--inside" aria-labelledby="host-inside">
           <div className="host__col-head">
-            <h2 id="host-inside">In the session</h2>
+            <h2 id="host-inside">In session</h2>
             <span className="host__count">{inside.length}</span>
           </div>
           {inside.length === 0 ? (
             <div className="host__empty">
-              <p className="host__empty-title">The room is empty.</p>
-              <p className="host__empty-text">Admitted guests and the owner appear here. Removing one closes every socket that tab opened.</p>
+              <span className="host__empty-icon" aria-hidden="true">
+                <Icon name="users" size={18} />
+              </span>
+              <p className="host__empty-title">No one is inside.</p>
+              <p className="host__empty-text">
+                Admitted guests and the owner appear here. Removing one closes every socket that tab opened.
+              </p>
             </div>
           ) : (
             <ul className="host__list">
@@ -351,7 +448,191 @@ export function HostApp() {
             </div>
           </dl>
         </section>
+        </div>
       </main>
+
+      <section className="host__tools" aria-labelledby="host-access">
+        <div className="host__tools-head">
+          <div>
+            <p className="host__eyebrow">Access &amp; distribution</p>
+            <h2 id="host-access">Invite, rotate, publish</h2>
+          </div>
+          <p>Links and keys for this session. Changes take effect immediately.</p>
+        </div>
+
+        <section className="host__panel host__panel--invites" aria-labelledby="host-invites">
+          <div className="host__panel-head">
+            <h3 id="host-invites">Invites</h3>
+            <span className="host__count">{invites.length}</span>
+          </div>
+          <p className="host__panel-note">
+            Each redemption creates a real {inviteRole} token, then goes through the same lobby.
+          </p>
+          <form className="host__invite-form" onSubmit={createInvite}>
+            <label className="host__field">
+              <span>Role</span>
+              <select
+                name="invite-role"
+                value={inviteRole}
+                onChange={(event) => setInviteRole(event.target.value as 'editor' | 'viewer')}
+              >
+                <option value="editor">Editor</option>
+                <option value="viewer">Viewer</option>
+              </select>
+            </label>
+            <label className="host__field">
+              <span>Expires in (min)</span>
+              <input
+                name="invite-ttl"
+                type="number"
+                min={1}
+                max={10080}
+                value={inviteTtl}
+                onChange={(event) => setInviteTtl(event.target.value)}
+                inputMode="numeric"
+                autoComplete="off"
+                placeholder="No expiry"
+              />
+            </label>
+            <label className="host__field">
+              <span>Use limit</span>
+              <input
+                name="invite-max-uses"
+                type="number"
+                min={1}
+                max={1000}
+                value={inviteMaxUses}
+                onChange={(event) => setInviteMaxUses(event.target.value)}
+                inputMode="numeric"
+                autoComplete="off"
+                placeholder="Unlimited"
+              />
+            </label>
+            <button className="button button--primary button--small" type="submit" disabled={busy === 'invite:create'}>
+              {busy === 'invite:create' ? 'Creating…' : 'Create invite'}
+            </button>
+          </form>
+          {inviteLink ? (
+            <div className="host__link">
+              <code>{inviteLink}</code>
+              <button className="button button--ghost button--small" onClick={() => void copyText(inviteLink, inviteLink)}>
+                {copied === inviteLink ? 'Copied' : 'Copy link'}
+              </button>
+            </div>
+          ) : null}
+          {invites.length === 0 ? (
+            <p className="host__empty-text">No live invites. Create one above when you need a shareable link.</p>
+          ) : (
+            <ul className="host__invite-list">
+              {invites.map((invite) => {
+                const link = info ? buildInviteUrl(info.guestOrigin, info.session.roomId, invite.id) : '';
+                const uses =
+                  invite.maxUses === null
+                    ? `${invite.usedCount} used · unlimited`
+                    : `${Math.max(0, invite.maxUses - invite.usedCount)} of ${invite.maxUses} left`;
+                return (
+                  <li key={invite.id} className="host__invite-row">
+                    <div className="host__invite-meta">
+                      <span className={`host__badge host__badge--${invite.role}`}>{invite.role}</span>
+                      <span>{uses}</span>
+                      <span>{invite.expiresAt === null ? 'no expiry' : `expires in ${until(invite.expiresAt, now)}`}</span>
+                    </div>
+                    <div className="host__invite-actions">
+                      <button
+                        className="button button--ghost button--small"
+                        onClick={() => void copyText(`invite:${invite.id}`, link)}
+                        disabled={!link}
+                      >
+                        {copied === `invite:${invite.id}` ? 'Copied' : 'Copy link'}
+                      </button>
+                      <button
+                        className="button button--ghost button--small host__deny"
+                        onClick={() => revokeInvite(invite)}
+                        disabled={busy === `invite:revoke:${invite.id}`}
+                      >
+                        Revoke
+                      </button>
+                    </div>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </section>
+
+        <section className="host__panel host__panel--tokens" aria-labelledby="host-tokens">
+          <div className="host__panel-head">
+            <h3 id="host-tokens">Role tokens</h3>
+          </div>
+          <p className="host__panel-note">
+            Rotation stops the old token for new connections. Existing sockets stay connected.
+          </p>
+          {ROLES.map((role) => {
+            const configured = tokenRoles.find((entry) => entry.role === role)?.configured ?? false;
+            return (
+              <div className="host__token" key={role}>
+                <div className="host__token-line">
+                  <span className={`host__badge host__badge--${role}`}>{role}</span>
+                  <span className="host__token-state">{configured ? 'configured' : 'not configured'}</span>
+                  <button
+                    className="button button--ghost button--small"
+                    onClick={() => rotate(role)}
+                    disabled={!configured || busy === `rotate:${role}`}
+                  >
+                    {busy === `rotate:${role}` ? 'Rotating…' : 'Rotate'}
+                  </button>
+                </div>
+                {rotated[role] ? (
+                  <div className="host__secret">
+                    <p>Copy now — this token will not be shown again. Rotating it also revoked this role’s live invites.</p>
+                    <code>{rotated[role]}</code>
+                    <button
+                      className="button button--primary button--small"
+                      onClick={() => void copyText(`token:${role}`, rotated[role] ?? '')}
+                    >
+                      {copied === `token:${role}` ? 'Copied' : 'Copy token'}
+                    </button>
+                  </div>
+                ) : null}
+              </div>
+            );
+          })}
+        </section>
+
+        <section className="host__panel host__panel--tunnel" aria-labelledby="host-tunnel">
+          <div className="host__panel-head">
+            <h3 id="host-tunnel">Public tunnel</h3>
+            {tunnel ? (
+              <span className={`host__badge ${tunnel.running ? 'host__badge--owner' : 'host__badge--viewer'}`}>
+                {tunnel.running ? 'running' : tunnel.configured ? 'configured' : 'not configured'}
+              </span>
+            ) : null}
+          </div>
+          {tunnel ? (
+            <>
+              <p className="host__panel-note">
+                Provider: {tunnel.provider ?? 'none'} · cloudflared{' '}
+                {tunnel.cloudflaredInstalled ? 'installed' : 'not installed'}
+              </p>
+              {tunnel.publicUrl ? (
+                <div className="host__qr-row">
+                  <HostQr url={tunnel.publicUrl} label="QR code for the public tunnel URL" />
+                  <div className="host__qr-copy">
+                    <code>{tunnel.publicUrl}</code>
+                    <button className="button button--ghost button--small" onClick={() => void copyText('tunnel', tunnel.publicUrl ?? '')}>
+                      {copied === 'tunnel' ? 'Copied' : 'Copy URL'}
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <p className="host__instructions">{tunnel.installInstructions ?? 'No public tunnel is running.'}</p>
+              )}
+            </>
+          ) : (
+            <p className="host__empty-text">Reading tunnel status…</p>
+          )}
+        </section>
+      </section>
 
       <footer className="host__foot">
         <span>Loopback only</span>
@@ -442,6 +723,15 @@ function relative(timestamp: number, now: number): string {
   if (seconds < 60) return `${seconds}s`;
   const minutes = Math.floor(seconds / 60);
   if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ${minutes % 60}m`;
+}
+
+function until(timestamp: number, now: number): string {
+  const seconds = Math.max(0, Math.round((timestamp - now) / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
   const hours = Math.floor(minutes / 60);
   return `${hours}h ${minutes % 60}m`;
 }

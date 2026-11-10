@@ -100,6 +100,49 @@ export class ApiError extends Error {
   }
 }
 
+export interface RedeemedInvite {
+  token: string;
+  role: 'editor' | 'viewer';
+}
+
+/** Exchange an invite link for a real guest token. Unauthenticated by design. */
+export async function redeemInvite(id: string, signal?: AbortSignal): Promise<RedeemedInvite> {
+  let response: Response;
+  try {
+    response = await fetch(`/api/invites/${encodeURIComponent(id)}/redeem`, {
+      method: 'POST',
+      headers: { Accept: 'application/json' },
+      signal,
+    });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') throw error;
+    throw new ApiError(0, 'NETWORK', 'Could not reach the host to redeem this invite.');
+  }
+
+  const text = await response.text();
+  let body: unknown;
+  try {
+    body = text.length > 0 ? JSON.parse(text) : undefined;
+  } catch {
+    body = undefined;
+  }
+
+  if (!response.ok) {
+    const payload = body as { error?: { code?: string; message?: string } } | undefined;
+    throw new ApiError(
+      response.status,
+      payload?.error?.code ?? 'HTTP_ERROR',
+      payload?.error?.message ?? 'This invite link is not valid or has expired.',
+    );
+  }
+
+  const redeemed = body as RedeemedInvite | undefined;
+  if (!redeemed || typeof redeemed.token !== 'string' || (redeemed.role !== 'editor' && redeemed.role !== 'viewer')) {
+    throw new ApiError(500, 'INVALID_RESPONSE', 'The host returned an invalid invite response.');
+  }
+  return redeemed;
+}
+
 export class ApiClient {
   constructor(private readonly token: string) {}
 

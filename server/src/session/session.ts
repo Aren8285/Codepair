@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { DocumentHub } from '../documents/documentHub.js';
 import { FileService } from '../files/fileService.js';
 import { AccessFileService } from '../files/policyFileService.js';
+import { InviteStore, type InviteTokenSource } from '../invites/invites.js';
 import { Lobby } from '../lobby/lobby.js';
 import { AccessPolicy, type Rule } from '../security/accessPolicy.js';
 import { PathGuard } from '../security/pathGuard.js';
@@ -26,6 +27,8 @@ export interface Session {
   readonly policy: AccessPolicy;
   /** The waiting room for this session; a root switch builds a fresh, empty one. */
   readonly lobby: Lobby;
+  /** Invite links for this root; a root switch builds a fresh, empty set. */
+  readonly invites: InviteStore;
   /** The single file-access choke point for one principal. */
   access(principal: Principal): AccessFileService;
 }
@@ -46,6 +49,10 @@ export interface SessionOptions {
     timeoutMs: number;
     onChange?: () => void;
   };
+  /** Guest token lookup used by invite redemption (never a token snapshot). */
+  inviteTokens?: InviteTokenSource;
+  /** Injectable clock for invite expiry/rate tests. */
+  inviteNow?: () => number;
 }
 
 /** Construct a session from a directory that already exists. */
@@ -64,6 +71,9 @@ export function createSession(root: string, options: SessionOptions): Session {
     timeoutMs: options.lobby?.timeoutMs ?? 120_000,
     onChange: options.lobby?.onChange,
   });
+  const invites = new InviteStore(options.inviteTokens ?? { tokenFor: () => undefined }, {
+    now: options.inviteNow,
+  });
   const session: Omit<Session, 'access'> = {
     id: randomUUID(),
     root: pathGuard.root,
@@ -74,6 +84,7 @@ export function createSession(root: string, options: SessionOptions): Session {
     terminals,
     policy,
     lobby,
+    invites,
   };
   return { ...session, access: (principal) => AccessFileService.forSession(session, principal) };
 }

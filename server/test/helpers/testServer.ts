@@ -5,6 +5,7 @@ import path from 'node:path';
 import { parseConfig, type ServerConfig } from '../../src/config.js';
 import { createCodepairServer, type CodepairServer } from '../../src/server.js';
 import type { Authenticator } from '../../src/security/auth.js';
+import type { TunnelStatus } from '../../src/tunnelStatus.js';
 
 export const TEST_TOKEN = 'test-token-0123456789abcdef';
 
@@ -53,6 +54,10 @@ export async function startTestServer(
      * with a principal no role can produce (for example an empty capability set).
      */
     authOverride?: Authenticator;
+    /** Test seam: the tunnel status the admin API should report (static or live). */
+    tunnelStatus?: TunnelStatus | (() => TunnelStatus);
+    /** Test seam: clock used by the session's invite store. */
+    inviteNow?: () => number;
     /** Interface the guest listener binds to. Defaults to loopback. */
     bindHost?: string;
     /**
@@ -99,10 +104,14 @@ export async function startTestServer(
     root,
   );
 
-  const server = await createCodepairServer(
-    config,
-    options.authOverride ? { authenticate: options.authOverride } : undefined,
-  );
+  const tunnelStatus = options.tunnelStatus;
+  const server = await createCodepairServer(config, {
+    ...(options.authOverride ? { authenticate: options.authOverride } : {}),
+    ...(tunnelStatus === undefined
+      ? {}
+      : { tunnelStatus: typeof tunnelStatus === 'function' ? tunnelStatus : () => tunnelStatus }),
+    ...(options.inviteNow ? { inviteNow: options.inviteNow } : {}),
+  });
   const { port, adminPort } = await server.start(0, options.bindHost ?? '127.0.0.1');
   const baseUrl = `http://127.0.0.1:${port}`;
   const adminBase = `http://127.0.0.1:${adminPort}`;
