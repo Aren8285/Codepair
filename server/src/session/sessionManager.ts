@@ -80,6 +80,9 @@ export class SessionManager {
       reason: SWITCH_CLOSE_REASON,
     });
     previous.terminals.dispose({ closeCode: SWITCH_CLOSE_CODE, reason: SWITCH_CLOSE_REASON });
+    // The waiting room belongs to the old root: its queue, seats and lock go
+    // away with it (a signal socket may still be connected, but it has no seat).
+    previous.lobby.dispose();
 
     return { changed: true, session: next, flushErrors };
   }
@@ -89,6 +92,7 @@ export class SessionManager {
     this.disposed = true;
     await this.active.documents.dispose();
     this.active.terminals.dispose();
+    this.active.lobby.dispose();
   }
 }
 

@@ -21,6 +21,8 @@ export interface TestServer {
   config: ServerConfig;
   root: string;
   base: string;
+  /** Origin for the three WebSocket endpoints (`ws://127.0.0.1:<port>`). */
+  wsBase: string;
   wsUrl: string;
   token: string;
   tokens: TestTokens;
@@ -53,6 +55,11 @@ export async function startTestServer(
     authOverride?: Authenticator;
     /** Interface the guest listener binds to. Defaults to loopback. */
     bindHost?: string;
+    /**
+     * Lobby behaviour. Defaults to `false`, which passes `--no-lobby` so the
+     * pre-lobby suites keep exercising the raw surfaces; lobby tests opt in.
+     */
+    lobby?: boolean;
   } = {},
 ): Promise<TestServer> {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'codepair-test-'));
@@ -76,6 +83,7 @@ export async function startTestServer(
       root,
       '--port',
       '0',
+      ...(options.lobby ? [] : ['--no-lobby']),
       ...(options.args ?? []),
       ...(options.tokens?.owner ? ['--token', tokens.owner] : []),
       ...(tokens.editor ? ['--editor-token', tokens.editor] : []),
@@ -105,6 +113,7 @@ export async function startTestServer(
     config,
     root: server.guard.root,
     base: baseUrl,
+    wsBase: `ws://127.0.0.1:${port}`,
     wsUrl: `ws://127.0.0.1:${port}/ws/doc`,
     token: tokens.owner,
     tokens,
@@ -145,7 +154,9 @@ export async function startTestServer(
                 if (typeof value === 'string') responseHeaders[key] = value;
                 else if (Array.isArray(value)) responseHeaders[key] = value.join(', ');
               }
-              resolve(new Response(text, { status: response.statusCode ?? 0, headers: responseHeaders }));
+              const status = response.statusCode ?? 0;
+              const body = status === 204 || status === 205 || status === 304 ? null : text;
+              resolve(new Response(body, { status, headers: responseHeaders }));
             });
           },
         );

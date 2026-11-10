@@ -310,9 +310,15 @@ describe('admin listener', () => {
       }));
 
     expect(routes.map((route) => `${route.methods.join(',')} ${route.path}`).sort()).toEqual([
+      'GET /admin/api/events',
       'GET /admin/api/fs/list',
+      'GET /admin/api/lobby',
       'GET /admin/api/policy',
       'GET /admin/api/state',
+      'POST /admin/api/connections/:connectionId/kick',
+      'POST /admin/api/lobby/:id/admit',
+      'POST /admin/api/lobby/:id/deny',
+      'POST /admin/api/lobby/lock',
       'POST /admin/api/session/root',
       'PUT /admin/api/policy/rules',
     ]);

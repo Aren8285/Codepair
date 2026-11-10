@@ -4,6 +4,7 @@ import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import '@xterm/xterm/css/xterm.css';
 import { Icon } from './Icon';
+import { currentConnectionId } from '../lib/connection';
 
 type TerminalStatus = 'connecting' | 'ready' | 'exited' | 'offline';
 
@@ -82,7 +83,10 @@ export function TerminalPanel({ token, rootName, onClose, onToast }: TerminalPan
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     let socket: WebSocket;
     try {
-      socket = new WebSocket(`${protocol}//${window.location.host}/ws/terminal`, ['codepair', token]);
+      socket = new WebSocket(
+        `${protocol}//${window.location.host}/ws/terminal?cid=${encodeURIComponent(currentConnectionId())}`,
+        ['codepair', token],
+      );
     } catch {
       term.writeln('\r\n\x1b[31mCould not open the terminal socket.\x1b[0m');
       setTerminalStatus('offline');

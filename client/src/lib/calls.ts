@@ -1,4 +1,5 @@
 import type { IceServer } from './api';
+import { currentConnectionId } from './connection';
 
 export type CallStatus = 'idle' | 'connecting' | 'active' | 'reconnecting' | 'error';
 
@@ -218,7 +219,7 @@ export class CallManager {
   private connectSocket(): void {
     if (this.destroyed) return;
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const url = `${protocol}//${window.location.host}/ws/signal?room=${encodeURIComponent(this.options.roomId)}`;
+    const url = `${protocol}//${window.location.host}/ws/signal?room=${encodeURIComponent(this.options.roomId)}&cid=${encodeURIComponent(currentConnectionId())}`;
     let socket: WebSocket;
     try {
       socket = new WebSocket(url, ['codepair', this.options.token]);

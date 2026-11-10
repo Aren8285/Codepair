@@ -1,6 +1,8 @@
+import fs from 'node:fs';
 import path from 'node:path';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import { AppError, toErrorPayload, unauthorized } from '../errors.js';
+import type { ConnectionRegistry } from '../lobby/connections.js';
 import { DEFAULT_SECRET_RULES, rulesUnhideDefaults, validateRules } from '../security/accessPolicy.js';
 import { tokenFromAuthorizationHeader, type Authenticator } from '../security/auth.js';
 import { requireCap } from '../security/gate.js';
@@ -27,6 +29,12 @@ export interface AdminAppOptions {
   port: () => number;
   /** Config-derived: does a shell bypass the path policy in this session? */
   terminalBypassesRules: () => boolean;
+  /** Daemon-level sockets, so one kick reaches every surface of a tab. */
+  connections: ConnectionRegistry;
+  /** Host console stream: writes the opening snapshot, returns the unsubscribe. */
+  subscribeEvents: (response: Response) => () => void;
+  /** Built client directory; `host.html` is served only from this listener. */
+  clientDist: string;
   logger?: Pick<Console, 'log' | 'error'>;
 }
 
@@ -49,6 +57,45 @@ export function createAdminApp(options: AdminAppOptions): express.Express {
     next();
   });
   app.use(securityHeaders);
+
+  // EventSource cannot set headers, so this ONE admin route accepts `?token=`.
+  // It authenticates itself and then goes through the same capability gate;
+  // every other admin route still reads only Authorization, and the cross-route
+  // test proves that is not a blanket query-token bypass.
+  const queryTokenAuth = (request: Request, response: Response, next: NextFunction): void => {
+    const raw = typeof request.query.token === 'string' ? request.query.token : undefined;
+    const principal = options.authenticate(raw);
+    if (!principal) {
+      response.setHeader('WWW-Authenticate', 'Bearer');
+      next(unauthorized());
+      return;
+    }
+    request.principal = principal;
+    next();
+  };
+
+  app.get('/admin/api/events', queryTokenAuth, requireCap('session.admin'), (request, response) => {
+    response.status(200);
+    response.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    response.setHeader('Cache-Control', 'no-store');
+    response.setHeader('Connection', 'keep-alive');
+    response.setHeader('X-Accel-Buffering', 'no');
+    response.flushHeaders();
+    const unsubscribe = options.subscribeEvents(response);
+    const heartbeat = setInterval(() => {
+      try {
+        response.write(': ping\n\n');
+      } catch {
+        // The client went away; 'close' does the cleanup.
+      }
+    }, 15_000);
+    heartbeat.unref?.();
+    request.on('close', () => {
+      clearInterval(heartbeat);
+      unsubscribe();
+      response.end();
+    });
+  });
 
   const authenticate = taggedAuthenticator(options.authenticate);
   app.use('/admin', authenticate);
@@ -127,6 +174,51 @@ export function createAdminApp(options: AdminAppOptions): express.Express {
     }),
   );
 
+  app.get('/admin/api/lobby', requireCap('session.admin'), (_request, response) => {
+    response.json(options.sessions.current().lobby.snapshot());
+  });
+
+  app.post('/admin/api/lobby/:id/admit', requireCap('session.admin'), (request, response) => {
+    const body = asRecord(request.body);
+    const role = body.role;
+    if (role !== 'editor' && role !== 'viewer') {
+      throw new AppError(400, 'BAD_REQUEST', '"role" must be "editor" or "viewer".');
+    }
+    const id = request.params.id;
+    if (!id) throw new AppError(400, 'BAD_REQUEST', 'A lobby entry id is required.');
+    response.json({ entry: options.sessions.current().lobby.admit(id, role) });
+  });
+
+  app.post('/admin/api/lobby/:id/deny', requireCap('session.admin'), (request, response) => {
+    const id = request.params.id;
+    if (!id) throw new AppError(400, 'BAD_REQUEST', 'A lobby entry id is required.');
+    response.json({ entry: options.sessions.current().lobby.deny(id) });
+  });
+
+  app.post('/admin/api/lobby/lock', requireCap('session.admin'), (request, response) => {
+    const body = asRecord(request.body);
+    if (typeof body.locked !== 'boolean') {
+      throw new AppError(400, 'BAD_REQUEST', '"locked" must be a boolean.');
+    }
+    const session = options.sessions.current();
+    session.lobby.setLocked(body.locked);
+    response.json(session.lobby.snapshot());
+  });
+
+  app.post(
+    '/admin/api/connections/:connectionId/kick',
+    requireCap('session.admin'),
+    (request, response) => {
+      const connectionId = request.params.connectionId;
+      if (!connectionId) throw new AppError(400, 'BAD_REQUEST', 'A connection id is required.');
+      // Mark the connection removed first, so a reconnect is refused, then
+      // close doc, terminal and signal sockets together.
+      options.sessions.current().lobby.kick(connectionId);
+      options.connections.close(connectionId);
+      response.status(204).end();
+    },
+  );
+
   app.post(
     '/admin/api/session/root',
     requireCap('session.admin'),
@@ -161,6 +253,36 @@ export function createAdminApp(options: AdminAppOptions): express.Express {
       });
     }),
   );
+
+  // The console page itself. It is not an API route and carries no token: the
+  // page asks for the token from its `#admin=` fragment, then authenticates
+  // every request it makes. Still behind the loopback guard above.
+  const hostHtml = path.join(options.clientDist, 'host.html');
+  if (fs.existsSync(hostHtml)) {
+    const sendHost = (_request: Request, response: Response): void => {
+      response.setHeader('Cache-Control', 'no-store');
+      response.sendFile(hostHtml);
+    };
+    app.get('/host', sendHost);
+    app.get('/host/', sendHost);
+    app.use(
+      '/assets',
+      express.static(path.join(options.clientDist, 'assets'), {
+        dotfiles: 'deny',
+        maxAge: '1y',
+        immutable: true,
+      }),
+    );
+  } else {
+    const hostMissing = (_request: Request, response: Response): void => {
+      response
+        .status(503)
+        .type('text/plain')
+        .send('The Host console UI is not built. Run `npm run build` and restart CodePair.');
+    };
+    app.get('/host', hostMissing);
+    app.get('/host/', hostMissing);
+  }
 
   app.use('/admin', (_request, _response, next) => {
     next(new AppError(404, 'NOT_FOUND', 'Unknown admin route.'));

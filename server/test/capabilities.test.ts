@@ -812,11 +812,13 @@ describe('route audit', () => {
       'DELETE /api/files',
       'GET /api/file',
       'GET /api/health',
+      'GET /api/lobby/status',
       'GET /api/search',
       'GET /api/session',
       'GET /api/tree',
       'POST /api/files',
       'POST /api/files/rename',
+      'POST /api/lobby/join',
     ]);
 
     for (const route of routes) {

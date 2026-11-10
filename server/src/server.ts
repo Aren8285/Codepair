@@ -2,11 +2,22 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import express, { type NextFunction, type Request, type Response } from 'express';
-import { WebSocketServer } from 'ws';
+import { WebSocketServer, type WebSocket } from 'ws';
 import { createAdminApp } from './admin/adminApp.js';
 import { ConfigError, generateToken, terminalBypassesRules, type ServerConfig } from './config.js';
 import { AppError, badRequest, unauthorized, toErrorPayload } from './errors.js';
 import { DEFAULT_IGNORED } from './files/fileService.js';
+import { ConnectionRegistry } from './lobby/connections.js';
+import {
+  LOBBY_CLOSE_CODE,
+  LOBBY_DENIED_REASON,
+  LOBBY_EXPIRED_REASON,
+  LOBBY_REMOVED_REASON,
+  LOBBY_WAITING_REASON,
+  isConnectionId,
+  type LobbyStatus,
+} from './lobby/lobby.js';
+import { seatPrincipal } from './lobby/principal.js';
 import {
   WS_PROTOCOL,
   createAuthenticator,
@@ -27,7 +38,7 @@ import { SignalingHub } from './signaling/signalingHub.js';
 export { CAPABILITY_GATE, requireCap };
 export type { CapabilityGate } from './security/gate.js';
 
-export const SERVER_VERSION = '0.3.2';
+export const SERVER_VERSION = '0.4.0';
 const MAX_WS_PAYLOAD = 2 * 1024 * 1024;
 
 /** Tags the `/api` authentication middleware (route audit). */
@@ -73,6 +84,35 @@ export async function createCodepairServer(
     ignored.add(name);
   }
 
+  // Daemon-level socket registry: a kick must still reach a tab's sockets after
+  // a root switch, when its seat lived in the disposed session's lobby.
+  const connections = new ConnectionRegistry();
+  const track = (webSocket: WebSocket, connectionId: string | undefined): void => {
+    if (!connectionId) return;
+    const untrack = connections.track(connectionId, webSocket);
+    webSocket.once('close', untrack);
+  };
+
+  // Host console fan-out: the opening snapshot, then one event per lobby change.
+  const eventClients = new Set<Response>();
+  const lobbySnapshotJson = () => JSON.stringify(sessions.current().lobby.snapshot());
+  const broadcastLobby = (): void => {
+    for (const client of eventClients) {
+      try {
+        client.write(`event: lobby\ndata: ${lobbySnapshotJson()}\n\n`);
+      } catch {
+        eventClients.delete(client);
+      }
+    }
+  };
+  const subscribeEvents = (response: Response): (() => void) => {
+    eventClients.add(response);
+    response.write(`event: snapshot\ndata: ${lobbySnapshotJson()}\n\n`);
+    return () => {
+      eventClients.delete(response);
+    };
+  };
+
   // The one active session. `config.root` is read exactly here and nowhere else
   // in the server; every request resolves the session it will use, once.
   const sessions = new SessionManager(config.root, {
@@ -80,6 +120,7 @@ export async function createCodepairServer(
     maxFileBytes: config.maxFileBytes,
     terminalEnabled: config.terminalEnabled,
     ignored,
+    lobby: { enabled: config.lobbyEnabled, timeoutMs: config.lobbyTimeoutMs, onChange: broadcastLobby },
   });
 
   // Signalling is session-independent: rooms are stable for the daemon's life.
@@ -99,6 +140,9 @@ export async function createCodepairServer(
     authenticate: adminAuthenticator,
     port: () => adminPort ?? 0,
     terminalBypassesRules: () => terminalBypassesRules(config),
+    connections,
+    subscribeEvents,
+    clientDist: config.clientDist,
   });
   const adminHttpServer = http.createServer(adminApp);
 
@@ -133,8 +177,10 @@ export async function createCodepairServer(
   app.use('/api', authenticateApi);
 
   app.get('/api/session', (request, response) => {
-    const principal = principalOf(request);
     const session = sessions.current();
+    // Reachable while waiting on purpose (the waiting screen needs it), and an
+    // admitted seat can only narrow what this tab is told it may do.
+    const principal = effectivePrincipal(session, principalOf(request), connectionIdOf(request));
     response.setHeader('Cache-Control', 'no-store');
     response.json({
       role: principal.role,
@@ -151,6 +197,63 @@ export async function createCodepairServer(
       limits: { maxFileBytes: config.maxFileBytes },
       rtc: { iceServers: config.iceServers },
     });
+  });
+
+  // Lobby (waiting room). `join` creates or retries this tab's request; `status`
+  // lets the waiting screen poll without any other file access.
+  app.post(
+    '/api/lobby/join',
+    requireCap('fs.read'),
+    asyncRoute(async (request, response) => {
+      const session = sessions.current();
+      const principal = principalOf(request);
+      const connectionId = connectionIdOf(request);
+      if (!connectionId) {
+        throw new AppError(403, 'LOBBY_REQUIRED', 'A connection id is required to join the lobby.');
+      }
+      const body = asRecord(request.body);
+      const displayName = typeof body.displayName === 'string' ? body.displayName : '';
+      response.json(session.lobby.request(connectionId, displayName, guestRoleOf(principal)));
+    }),
+  );
+
+  app.get('/api/lobby/status', requireCap('fs.read'), (request, response) => {
+    const session = sessions.current();
+    const connectionId = connectionIdOf(request);
+    if (!connectionId) {
+      throw new AppError(403, 'LOBBY_REQUIRED', 'A connection id is required to join the lobby.');
+    }
+    response.json(session.lobby.status(connectionId, guestRoleOf(principalOf(request))));
+  });
+
+  // The waiting room: every guest route below needs an admitted connection. The
+  // owner token never waits. A connection id alone grants nothing — it must
+  // belong to an admitted entry, and its seat can only narrow the token's
+  // capabilities. Anything unrecognized fails closed as "waiting".
+  app.use('/api', (request, _response, next) => {
+    const principal = principalOf(request);
+    if (principal.role === 'owner') {
+      next();
+      return;
+    }
+    const session = sessions.current();
+    if (!session.lobby.enabled) {
+      next();
+      return;
+    }
+    const connectionId = connectionIdOf(request);
+    if (!connectionId) {
+      next(new AppError(403, 'LOBBY_REQUIRED', 'A connection id is required to use this API.'));
+      return;
+    }
+    const seat = session.lobby.seatFor(connectionId);
+    // An owner's connection id is not a guest seat: never let it be borrowed.
+    if (!seat || seat.role === 'owner') {
+      next(lobbyError(session.lobby.status(connectionId, guestRoleOf(principal))));
+      return;
+    }
+    request.principal = seatPrincipal(principal, seat.role);
+    next();
   });
 
   app.get('/api/tree', requireCap('fs.read'), asyncRoute(async (request, response) => {
@@ -211,6 +314,16 @@ export async function createCodepairServer(
   app.use('/admin', (_request, _response, next) => {
     next(new AppError(404, 'NOT_FOUND', 'Not found.'));
   });
+
+  // The Host console lives on the loopback admin listener, never on this one.
+  const hostConsoleElsewhere = (_request: Request, response: Response): void => {
+    response
+      .status(404)
+      .type('text/plain')
+      .send('The Host console runs on the loopback admin port printed at startup.');
+  };
+  app.get('/host', hostConsoleElsewhere);
+  app.get('/host/', hostConsoleElsewhere);
 
   const hasClientBuild = fs.existsSync(path.join(config.clientDist, 'index.html'));
   if (hasClientBuild) {
@@ -305,21 +418,53 @@ export async function createCodepairServer(
       return;
     }
 
+    // One session for this upgrade: the lobby decision, the access check and
+    // the connection below all belong to the same root selection.
+    const session = sessions.current();
+    let upgradePrincipal = principal;
+    let upgradeConnectionId: string | undefined;
+    let refusal: string | undefined;
+    const rawConnectionId = url.searchParams.get('cid');
+    if (principal.role === 'owner') {
+      if (isConnectionId(rawConnectionId)) {
+        upgradeConnectionId = rawConnectionId;
+        session.lobby.connectDirect(rawConnectionId, 'Owner', 'owner');
+      }
+    } else if (!session.lobby.enabled) {
+      // No waiting room: every authenticated connection is admitted, and no
+      // connection id is needed (the pre-lobby suites run this way).
+    } else if (!isConnectionId(rawConnectionId)) {
+      refusal = 'A connection id is required to join this room.';
+    } else {
+      const seat = session.lobby.seatFor(rawConnectionId);
+      if (seat && seat.role !== 'owner') {
+        upgradePrincipal = seatPrincipal(principal, seat.role);
+        upgradeConnectionId = rawConnectionId;
+      } else {
+        refusal = lobbyRefusalReason(session.lobby.status(rawConnectionId, guestRoleOf(principal)));
+      }
+    }
+
     if (url.pathname === '/ws/doc') {
       const docPath = url.searchParams.get('path');
       if (!docPath) {
         rejectUpgrade(socket, 400, 'Bad Request', 'Missing path.');
         return;
       }
-      if (!can(principal, 'fs.read')) {
+      // A waiting room refusal completes the upgrade and closes with a code, so
+      // the tab can tell "ask the host" from "that file is gone".
+      if (refusal !== undefined) {
+        lobbyRefuse(docWss, request, socket, head, refusal);
+        return;
+      }
+      if (!can(upgradePrincipal, 'fs.read')) {
         rejectUpgrade(socket, 403, 'Forbidden', 'You do not have permission to open files.');
         return;
       }
 
       // One resolution per connection: everything below uses this session,
       // even if the Host switches root while the file is being read.
-      const session = sessions.current();
-      const access = session.access(principal);
+      const access = session.access(upgradePrincipal);
       try {
         session.pathGuard.resolve(docPath);
       } catch (error) {
@@ -346,6 +491,7 @@ export async function createCodepairServer(
             // client stops reconnecting instead of seeing a rejected upgrade.
             docWss.handleUpgrade(request, socket, head, (webSocket) => {
               docWss.emit('connection', webSocket, request);
+              track(webSocket, upgradeConnectionId);
               session.documents.connect(docPath, webSocket, decision.write, access.view);
             });
             return;
@@ -358,6 +504,7 @@ export async function createCodepairServer(
         if (socket.destroyed) return;
         docWss.handleUpgrade(request, socket, head, (webSocket) => {
           docWss.emit('connection', webSocket, request);
+          track(webSocket, upgradeConnectionId);
           session.documents.connect(docPath, webSocket, decision.write, access.view);
         });
       })();
@@ -365,10 +512,14 @@ export async function createCodepairServer(
     }
 
     if (url.pathname === '/ws/terminal') {
-      const session = sessions.current();
+      if (refusal !== undefined) {
+        lobbyRefuse(terminalWss, request, socket, head, refusal);
+        return;
+      }
       terminalWss.handleUpgrade(request, socket, head, (webSocket) => {
         terminalWss.emit('connection', webSocket, request);
-        session.terminals.handle(webSocket, principal);
+        track(webSocket, upgradeConnectionId);
+        session.terminals.handle(webSocket, upgradePrincipal);
       });
       return;
     }
@@ -378,9 +529,14 @@ export async function createCodepairServer(
         rejectUpgrade(socket, 404, 'Not Found', 'Unknown room.');
         return;
       }
+      if (refusal !== undefined) {
+        lobbyRefuse(signalWss, request, socket, head, refusal);
+        return;
+      }
       signalWss.handleUpgrade(request, socket, head, (webSocket) => {
         signalWss.emit('connection', webSocket, request);
-        signaling.handle(webSocket, principal);
+        track(webSocket, upgradeConnectionId);
+        signaling.handle(webSocket, upgradePrincipal);
       });
       return;
     }
@@ -450,6 +606,7 @@ export async function createCodepairServer(
       closed = true;
       await sessions.dispose();
       signaling.dispose();
+      connections.clear();
       for (const client of docWss.clients) client.terminate();
       for (const client of terminalWss.clients) client.terminate();
       for (const client of signalWss.clients) client.terminate();
@@ -532,6 +689,70 @@ function asyncRoute(handler: (request: Request, response: Response) => Promise<v
   return (request: Request, response: Response, next: NextFunction) => {
     handler(request, response).catch(next);
   };
+}
+
+/** The per-tab connection id sent as a header (guest HTTP) or query (ws). */
+function connectionIdOf(request: Request): string | undefined {
+  const raw = request.headers['x-codepair-connection'];
+  return isConnectionId(raw) ? raw : undefined;
+}
+
+/** The guest instances of `Role`, narrowed for the lobby (host never reaches here). */
+function guestRoleOf(principal: Principal): 'owner' | 'editor' | 'viewer' {
+  return principal.role === 'owner' || principal.role === 'editor' ? principal.role : 'viewer';
+}
+
+/** A seat may only narrow a token's capabilities, never widen them. */
+function effectivePrincipal(
+  session: Session,
+  principal: Principal,
+  connectionId: string | undefined,
+): Principal {
+  if (principal.role === 'owner' || !connectionId) return principal;
+  const seat = session.lobby.seatFor(connectionId);
+  if (!seat || seat.role === 'owner') return principal;
+  return seatPrincipal(principal, seat.role);
+}
+
+/** HTTP refusal for a connection that may not touch the file API yet. */
+function lobbyError(status: LobbyStatus): AppError {
+  switch (status.state) {
+    case 'denied':
+      return new AppError(403, 'LOBBY_DENIED', LOBBY_DENIED_REASON);
+    case 'expired':
+      return new AppError(403, 'LOBBY_EXPIRED', LOBBY_EXPIRED_REASON);
+    case 'removed':
+      return new AppError(403, 'LOBBY_REMOVED', LOBBY_REMOVED_REASON);
+    case 'withdrawn':
+      return new AppError(403, 'LOBBY_CLOSED', 'Your request was withdrawn.');
+    default:
+      return new AppError(403, 'LOBBY_WAITING', LOBBY_WAITING_REASON);
+  }
+}
+
+function lobbyRefusalReason(status: LobbyStatus): string {
+  if (status.state === 'denied') return LOBBY_DENIED_REASON;
+  if (status.state === 'removed') return LOBBY_REMOVED_REASON;
+  if (status.state === 'expired') return LOBBY_EXPIRED_REASON;
+  return LOBBY_WAITING_REASON;
+}
+
+/**
+ * Refuse a lobby candidate the way a WebSocket client can understand: finish
+ * the upgrade, then close with 4425 and a reason, so the tab shows the waiting
+ * (or declined/removed) screen instead of a generic connection error.
+ */
+function lobbyRefuse(
+  wss: WebSocketServer,
+  request: http.IncomingMessage,
+  socket: import('node:stream').Duplex,
+  head: Buffer,
+  reason: string,
+): void {
+  wss.handleUpgrade(request, socket, head, (webSocket) => {
+    webSocket.on('error', () => {});
+    webSocket.close(LOBBY_CLOSE_CODE, reason);
+  });
 }
 
 /** The `/api` middleware always sets a principal; this only narrows the type. */

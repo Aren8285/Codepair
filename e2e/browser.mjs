@@ -74,6 +74,12 @@ async function openRoom(page) {
 }
 
 async function openFile(page, name) {
+  await page.waitForFunction(
+    (target) =>
+      [...document.querySelectorAll('button')].some((candidate) => (candidate.textContent ?? '').trim() === target),
+    { timeout: 20000 },
+    name,
+  );
   const clicked = await page.evaluate((target) => {
     const button = [...document.querySelectorAll('button')].find(
       (candidate) => (candidate.textContent ?? '').trim() === target,

@@ -44,6 +44,10 @@ export interface ServerConfig {
   rules: Rule[];
   /** The Host confirmed lifting a built-in secret default (`--confirm-unhide`). */
   confirmUnhide: boolean;
+  /** Join approval is on unless `--no-lobby`. */
+  lobbyEnabled: boolean;
+  /** A pending lobby entry expires after this long (`--lobby-timeout`). */
+  lobbyTimeoutMs: number;
   iceServers: IceServerConfig[];
   tunnelProvider?: TunnelProvider;
   clientDist: string;
@@ -159,6 +163,17 @@ export function parseConfig(
   } catch (error) {
     throw new ConfigError(error instanceof Error ? error.message : 'Invalid --rule.');
   }
+  const lobbyEnabled = flags['no-lobby'] !== true;
+  const lobbyTimeoutRaw = flagValue(flags, 'lobby-timeout');
+  let lobbyTimeoutMs = 120_000;
+  if (lobbyTimeoutRaw !== undefined) {
+    const seconds = Number(lobbyTimeoutRaw);
+    if (!Number.isInteger(seconds) || seconds < 1 || seconds > 3600) {
+      throw new ConfigError(`Invalid lobby timeout "${lobbyTimeoutRaw}". Use 1-3600 seconds.`);
+    }
+    lobbyTimeoutMs = seconds * 1000;
+  }
+
   const confirmUnhide = flags['confirm-unhide'] === true;
   if (rulesUnhideDefaults(rules) && !confirmUnhide) {
     throw new ConfigError('A --rule exposes a built-in secret default; pass --confirm-unhide to allow it.');
@@ -180,6 +195,8 @@ export function parseConfig(
     terminalEnabled: !flags['no-terminal'] && env.CODE_PAIR_TERMINAL !== 'off',
     rules,
     confirmUnhide,
+    lobbyEnabled,
+    lobbyTimeoutMs,
     iceServers: parseIceServers(flagValue(flags, 'ice-servers') ?? env.CODE_PAIR_ICE_SERVERS),
     tunnelProvider: tunnelRaw as TunnelProvider | undefined,
     clientDist: path.resolve(

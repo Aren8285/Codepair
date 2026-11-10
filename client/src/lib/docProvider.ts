@@ -3,6 +3,7 @@ import * as awarenessProtocol from 'y-protocols/awareness';
 import * as syncProtocol from 'y-protocols/sync';
 import * as decoding from 'lib0/decoding';
 import * as encoding from 'lib0/encoding';
+import { currentConnectionId } from './connection';
 
 const MESSAGE_SYNC = 0;
 const MESSAGE_AWARENESS = 1;
@@ -36,10 +37,12 @@ interface ProviderOptions {
 
 /**
  * 4410 is the Host moving this session to a different project: permanent, never
- * retried, because the old root is gone. Other codes cover malformed frames,
- * denied access, a missing file, a replaced session and an oversized document.
+ * retried, because the old root is gone. 4425/4429 mean this tab has no seat
+ * any more (waiting room, declined, removed): retrying only spins. Other codes
+ * cover malformed frames, denied access, a missing file, a replaced session and
+ * an oversized document.
  */
-const PERMANENT_CLOSE_CODES = new Set([4400, 4403, 4404, 4409, 4410, 4413]);
+const PERMANENT_CLOSE_CODES = new Set([4400, 4403, 4404, 4409, 4410, 4413, 4425, 4429]);
 const MAX_BACKOFF_MS = 8_000;
 
 /**
@@ -109,7 +112,7 @@ export class DocProvider {
   private connect(): void {
     if (this.destroyed) return;
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const url = `${protocol}//${window.location.host}/ws/doc?path=${encodeURIComponent(this.options.path)}`;
+    const url = `${protocol}//${window.location.host}/ws/doc?path=${encodeURIComponent(this.options.path)}&cid=${encodeURIComponent(currentConnectionId())}`;
     this.setState(this.attempts === 0 ? 'connecting' : 'reconnecting');
 
     let socket: WebSocket;

@@ -47,7 +47,7 @@ async function main(): Promise<void> {
     return;
   }
   if (argv.includes('--version')) {
-    process.stdout.write('0.3.2\n');
+    process.stdout.write('0.4.0\n');
     return;
   }
 

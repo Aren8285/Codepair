@@ -1,3 +1,5 @@
+import { currentConnectionId } from './connection';
+
 export type AccessMode = 'read-only' | 'read-write';
 
 export type Role = 'owner' | 'editor' | 'viewer';
@@ -22,6 +24,39 @@ export interface SessionInfo {
   startedAt: number;
   limits: { maxFileBytes: number };
   rtc: { iceServers: IceServer[] };
+}
+
+export type LobbyState = 'none' | 'waiting' | 'admitted' | 'denied' | 'expired' | 'withdrawn' | 'removed';
+
+export interface LobbyStatus {
+  enabled: boolean;
+  locked: boolean;
+  state: LobbyState;
+  displayName?: string;
+  seat?: 'editor' | 'viewer';
+  expiresAt?: number;
+}
+
+export interface LobbyEntry {
+  id: string;
+  connectionId: string;
+  displayName: string;
+  requestedAt: number;
+  state: string;
+  tokenRole: 'owner' | 'editor' | 'viewer';
+  grantedRole?: 'editor' | 'viewer';
+}
+
+export interface LobbySnapshot {
+  enabled: boolean;
+  locked: boolean;
+  pending: LobbyEntry[];
+  admitted: Array<{
+    connectionId: string;
+    displayName: string;
+    role: 'owner' | 'editor' | 'viewer';
+    connectedSince: number;
+  }>;
 }
 
 export interface FileEntry {
@@ -72,6 +107,19 @@ export class ApiClient {
     return this.request<SessionInfo>('/api/session', { signal });
   }
 
+  /** Ask the Host to let this tab in; idempotent while a request is pending. */
+  joinLobby(displayName: string): Promise<LobbyStatus> {
+    return this.request<LobbyStatus>('/api/lobby/join', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ displayName }),
+    });
+  }
+
+  lobbyStatus(): Promise<LobbyStatus> {
+    return this.request<LobbyStatus>('/api/lobby/status');
+  }
+
   tree(path = '', signal?: AbortSignal): Promise<TreeResponse> {
     return this.request<TreeResponse>(`/api/tree?path=${encodeURIComponent(path)}`, { signal });
   }
@@ -112,6 +160,8 @@ export class ApiClient {
         headers: {
           Accept: 'application/json',
           Authorization: `Bearer ${this.token}`,
+          // One id per tab: the Host's admission (and its seat) is keyed on it.
+          'X-CodePair-Connection': currentConnectionId(),
           ...(init.headers ?? {}),
         },
       });

@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ApiClient, ApiError, describeApiError, type FileEntry, type SessionInfo } from './lib/api';
+import { ApiClient, ApiError, describeApiError, type FileEntry, type LobbyStatus, type SessionInfo } from './lib/api';
 import { baseName, languageForPath, parentDirectory } from './lib/language';
 import { clearStoredToken, loadToken, roomFromPath, storeToken } from './lib/token';
+import { rotateConnectionId } from './lib/connection';
 import { currentPresence } from './lib/presence';
 import { exportEditorFile } from './lib/download';
 import { CallManager } from './lib/calls';
@@ -16,6 +17,7 @@ import { Welcome } from './components/Welcome';
 import { TerminalPanel } from './components/TerminalPanel';
 import { StatusBar } from './components/StatusBar';
 import { TokenGate } from './components/TokenGate';
+import { LobbyScreen, type LobbyGateView } from './components/LobbyScreen';
 import { CallDock } from './components/CallDock';
 import {
   DeleteDialog,
@@ -28,6 +30,7 @@ import { HelpDialog } from './components/HelpDialog';
 import { Icon, PairMark } from './components/Icon';
 
 type SessionState = 'idle' | 'loading' | 'ready' | 'error';
+type LobbyView = LobbyGateView | 'admitted';
 
 type ModalState =
   | { kind: 'share' }
@@ -49,6 +52,91 @@ export function App() {
   const [routeRoom, setRouteRoom] = useState<string | null>(() => roomFromPath(window.location.pathname));
   const [malformedRoom] = useState(() => window.location.pathname.startsWith('/room/') && roomFromPath(window.location.pathname) === null);
   const api = useMemo(() => (token ? new ApiClient(token) : null), [token]);
+
+  // Admission state. `checking` is the moment between "token accepted" and the
+  // Host's answer; `admitted` is the only view that renders the workspace.
+  const [lobbyView, setLobbyView] = useState<LobbyView>('checking');
+  const [lobbyMessage, setLobbyMessage] = useState('');
+  const [joinAttempt, setJoinAttempt] = useState(0);
+
+  const applyLobbyStatus = useCallback((status: LobbyStatus) => {
+    setLobbyMessage('');
+    if (status.state === 'admitted') setLobbyView('admitted');
+    else if (status.state === 'waiting') setLobbyView('waiting');
+    else if (status.state === 'denied') setLobbyView('denied');
+    else if (status.state === 'expired') setLobbyView('expired');
+    else if (status.state === 'removed') setLobbyView('removed');
+    else setLobbyView('checking');
+  }, []);
+
+  const applyLobbyError = useCallback((error: unknown) => {
+    if (error instanceof ApiError) {
+      switch (error.code) {
+        case 'LOBBY_LOCKED':
+          setLobbyView('locked');
+          return;
+        case 'LOBBY_FULL':
+          setLobbyView('full');
+          return;
+        case 'LOBBY_DENIED':
+          setLobbyView('denied');
+          return;
+        case 'LOBBY_REMOVED':
+          setLobbyView('removed');
+          return;
+        case 'LOBBY_EXPIRED':
+          setLobbyView('expired');
+          return;
+        case 'LOBBY_WAITING':
+          setLobbyView('waiting');
+          return;
+        default:
+          break;
+      }
+      if (error.status === 401) {
+        clearStoredToken();
+        setToken(null);
+        setSession(null);
+        setSessionState('idle');
+        setAuthError('That access token was rejected. Ask the host for a fresh link.');
+        return;
+      }
+    }
+    setLobbyView('checking');
+    setLobbyMessage(describeApiError(error));
+  }, []);
+
+  useEffect(() => {
+    if (!api || !session || sessionState !== 'ready') return;
+    let cancelled = false;
+    setLobbyView('checking');
+    setLobbyMessage('');
+    api
+      .joinLobby(currentPresence().name)
+      .then((status) => {
+        if (!cancelled) applyLobbyStatus(status);
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) applyLobbyError(error);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [api, session, sessionState, joinAttempt, applyLobbyStatus, applyLobbyError]);
+
+  // While waiting, poll the cheap status route; it is reachable before admission.
+  useEffect(() => {
+    if (lobbyView !== 'waiting' || !api) return;
+    const timer = window.setInterval(() => {
+      api.lobbyStatus().then(applyLobbyStatus).catch(applyLobbyError);
+    }, 1500);
+    return () => window.clearInterval(timer);
+  }, [lobbyView, api, applyLobbyStatus, applyLobbyError]);
+
+  const retryLobby = useCallback((freshIdentity: boolean) => {
+    if (freshIdentity) rotateConnectionId();
+    setJoinAttempt((value) => value + 1);
+  }, []);
 
   // Keep the app exactly as tall as the visual viewport so the virtual keyboard
   // shrinks the workspace instead of hiding Monaco or the status bar.
@@ -79,6 +167,9 @@ export function App() {
     const controller = new AbortController();
     setSessionState('loading');
     setSessionError('');
+    // A fresh session (new token, reload after a switch) must ask again.
+    setLobbyView('checking');
+    setLobbyMessage('');
     api
       .session(controller.signal)
       .then((info) => {
@@ -152,7 +243,31 @@ export function App() {
     );
   }
 
-  return <Workspace token={token} api={api} session={session} onLock={lock} roomId={routeRoom ?? session.roomId} />;
+  if (lobbyView !== 'admitted') {
+    return (
+      <LobbyScreen
+        view={lobbyView}
+        rootName={session.rootName}
+        displayName={currentPresence().name}
+        message={lobbyMessage}
+        onRetry={retryLobby}
+        onLeave={lock}
+      />
+    );
+  }
+
+  const lostLobby = () => setRetryKey((value) => value + 1);
+
+  return (
+    <Workspace
+      token={token}
+      api={api}
+      session={session}
+      onLock={lock}
+      onLobbyLost={lostLobby}
+      roomId={routeRoom ?? session.roomId}
+    />
+  );
 }
 
 function Workspace({
@@ -161,12 +276,14 @@ function Workspace({
   session,
   roomId,
   onLock,
+  onLobbyLost,
 }: {
   token: string;
   api: ApiClient;
   session: SessionInfo;
   roomId: string;
   onLock: () => void;
+  onLobbyLost: () => void;
 }) {
   const readOnly = !session.capabilities.includes('fs.write');
   const terminalAvailable = session.capabilities.includes('term.use');
@@ -214,6 +331,23 @@ function Workspace({
   );
 
   useEffect(() => () => callManager.destroy(), [callManager]);
+
+  // A seat can end while this tab is open (kick, deny, root switch). Document
+  // sockets report 4425/4429 immediately; this slow poll is the net for tabs
+  // with no document open, such as a terminal-only session.
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      void api
+        .lobbyStatus()
+        .then((status) => {
+          if (status.enabled && status.state !== 'admitted') onLobbyLost();
+        })
+        .catch((error: unknown) => {
+          if (error instanceof ApiError && error.code === 'LOBBY_REMOVED') onLobbyLost();
+        });
+    }, 5000);
+    return () => window.clearInterval(timer);
+  }, [api, onLobbyLost]);
 
   const activeStatus = activePath ? editorStatus[activePath] : undefined;
   const activeCursor = (activePath ? cursors[activePath] : undefined) ?? { line: 1, column: 1, selected: 0 };
@@ -358,6 +492,12 @@ function Workspace({
 
   const handleFatal = useCallback(
     (path: string, message: string, code: number) => {
+      if (code === 4425 || code === 4429) {
+        // The tab lost its seat: close everything and go back through the lobby.
+        removeTabs(() => true);
+        onLobbyLost();
+        return;
+      }
       if (code === 4403) {
         // The Host removed access to this file. Close its tab and explain once
         // per path; this has its own dedupe, independent of the 4410 latch.
@@ -383,7 +523,7 @@ function Workspace({
       );
       void refreshTree();
     },
-    [closePathsUnder, editorStatus, notify, refreshTree],
+    [closePathsUnder, editorStatus, notify, onLobbyLost, refreshTree, removeTabs],
   );
 
   const createEntry = useCallback(

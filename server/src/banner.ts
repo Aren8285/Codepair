@@ -30,7 +30,7 @@ export function buildBanner(config: ServerConfig, info: BannerInfo): string {
   lines.push('');
   lines.push(`  Host console: \u001b[4mhttp://127.0.0.1:${info.adminPort}/host#admin=${info.adminToken}\u001b[0m`);
   lines.push(
-    '  \u001b[38;5;242m(console UI arrives in 0.4; until then use the value after #admin= as a Bearer token)\u001b[0m',
+    '  \u001b[38;5;242mLoopback only. The link opens the console; its token stays in that browser tab.\u001b[0m',
   );
   lines.push('');
   lines.push(`  Room      ${roomId}`);

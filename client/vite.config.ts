@@ -25,6 +25,14 @@ export default defineConfig({
     outDir: 'dist',
     sourcemap: false,
     chunkSizeWarningLimit: 4000,
+    // Guest workspace and the loopback Host console are separate pages; the
+    // admin listener serves host.html from the same build.
+    rollupOptions: {
+      input: {
+        main: 'index.html',
+        host: 'host.html',
+      },
+    },
   },
   worker: {
     format: 'es',
