@@ -217,6 +217,11 @@ loopback-only listener. It is a different `http.Server`, bound to `127.0.0.1` on
 `--admin-port` no matter what `--host` says, and none of its routes exist on the
 guest port (the guest app answers `/admin/*` with a 404).
 
+The console is a page-level control room: waiting-room and in-session activity come first,
+then **Access & distribution** with the invite composer, role tokens and tunnel status. It
+stacks at narrow widths, scrolls instead of clipping fixed-height tool panels, and keeps
+the admin token in that tab.
+
 - Its token is generated fresh on every start (`crypto.randomBytes(32)`, base64url) and
   printed once, on the `Host console:` banner line, inside the `#admin=` fragment. It is
   never returned in a response body.
