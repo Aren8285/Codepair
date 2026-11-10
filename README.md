@@ -38,9 +38,12 @@ Host machine                                    Remote clients
 - **Path access rules** — per-session `hidden` / `r` / `rw` glob rules, enforced at one
   choke point across the tree, search, reads, mutations and document sockets; built-in
   secret defaults stay hidden until the Host explicitly confirms unhiding.
-- **Loopback Host console** — a separate admin listener (own token, its own port) can move
-  the session to another project and replace the rule list live, without disconnecting
-  anyone whose access did not change.
+- **Join approval (lobby)** — every guest token waits in a queue until the Host admits it
+  as editor or viewer, denies it, or lets it expire; the Host can lock the room and kick a
+  tab at any moment. `--no-lobby` restores the old "open the link and you are in" flow.
+- **Loopback Host console** — a separate admin listener (own token, its own port) serves
+  `/host`: a live queue over SSE, admit/deny, kick and room lock, plus the project switch
+  and live rule editor. None of it exists on the guest port.
 - **Token auth everywhere** — a random 256-bit token per start, checked on every HTTP
   route and every WebSocket upgrade; the token travels in the URL fragment, never in
   query strings or logs.
@@ -81,6 +84,8 @@ query strings, `Referer` headers or access logs.
 | `--token <token>` | random per start | Primary token: **owner**, or **viewer** with `--mode read-only`. 16–512 bytes, URL-safe |
 | `--editor-token <token>` | — | Extra token with editor access |
 | `--viewer-token <token>` | — | Extra token with view-only access |
+| `--no-lobby` | lobby on | Admit every authenticated guest immediately; lobby actions then return `409 LOBBY_DISABLED` |
+| `--lobby-timeout <seconds>` | `120` | Pending request lifetime, 1–3600; an unanswered request expires and may retry |
 | `--no-terminal` | terminal on | Explicit Host opt-out of remote shells |
 | `--rule <glob>=<access>` | — | Path rule (`hidden`, `r`, `rw`), repeatable up to 50, validated at startup |
 | `--confirm-unhide` | off | Required when a `--rule` lifts a built-in secret default |
@@ -115,6 +120,38 @@ Every token maps to exactly one role, and the role decides what that session may
 - `--no-terminal` still wins over every role: no token gets a shell.
 - A viewer's edits are dropped server-side and the UI explains why, but their cursor and
   presence still reach everyone else.
+- **A seat can only narrow.** When the Host admits an editor token as a viewer, effective
+  capabilities are the intersection of token and seat, so that tab keeps reading but its
+  writes are refused. A viewer token can never be admitted as an editor (`ROLE_CEILING`).
+- **The owner token never waits.** It bypasses the lobby and the lock, and its connection
+  id can never be borrowed by a guest.
+
+## Join lobby
+
+Guest tokens ask once per browser tab. The client generates a per-tab connection id
+(`sessionStorage`, sent as `X-CodePair-Connection` on HTTP and `?cid=` on WebSocket
+upgrades), shows a waiting screen, and polls `/api/lobby/status` while the Host decides in
+the console:
+
+- **Pending** — up to 50 requests are queued; the 51st is refused with `429 LOBBY_FULL`
+  rather than silently dropped. An unanswered request expires after `--lobby-timeout`
+  (default 120 s) and may ask again.
+- **Admitted** — the tab gets a seat. Every guest `/api/*` route except `/api/health`,
+  `/api/session` and `/api/lobby/*` now requires that seat. Document, terminal and
+  signalling sockets are checked at upgrade time; a refusal completes the upgrade and
+  closes with **4425** and a reason, so the app can tell "ask the Host" from "that file is
+  gone".
+- **Denied / removed** — terminal for that connection id: reconnecting with it is refused.
+  "Ask again" clears the id and queues as a new request; a reload does the same.
+- **Locked** — new requests are refused (`LOBBY_LOCKED`); already-admitted tabs keep
+  working, and the Host's own token still enters.
+- **Kicked** — the Host closes every socket for that tab with **4429** and makes the
+  request terminal. A retry on the same id is refused; clearing the id queues again.
+- **Fails closed** — a missing, malformed or unrecognized connection id is never admitted.
+
+`--no-lobby` skips all of this: joins are admitted immediately, no connection id is
+required on any surface, and lobby actions answer `409 LOBBY_DISABLED`. The lobby is per
+session, so a root switch starts with an empty queue.
 
 ## Path access policy
 
@@ -181,6 +218,12 @@ guest port (the guest app answers `/admin/*` with a 404).
   `CF-Connecting-IP` / `X-Real-IP`. Responses are `no-store` and never CORS.
 - Guest tokens are rejected on this listener and the admin token is rejected on the guest
   listener. Every route requires the `session.admin` capability.
+- The console UI is served at `/host` (and `/host/`) **only on this listener**; the guest
+  port answers `404`. Opening the printed `#admin=` link stores the admin token in that
+  tab's `sessionStorage`, away from the guest app.
+- `GET /admin/api/events` is the one route that also accepts `?token=`, because
+  `EventSource` cannot set headers. It is a per-route middleware, not a global query-token
+  fallback: every other admin route still reads only `Authorization`.
 
 | Route | Purpose |
 | --- | --- |
@@ -189,6 +232,12 @@ guest port (the guest app answers `/admin/*` with a 404).
 | `POST /admin/api/session/root` | `{ "path": "…", "confirmBroad": false }` → switches the project root |
 | `GET /admin/api/policy` | current `rules`, the built-in `defaults`, `confirmUnhide`, `terminalBypassesRules` |
 | `PUT /admin/api/policy/rules` | `{ "rules": [{ "pattern": "…", "access": "hidden\|r\|rw" }], "confirmUnhide": false }` → validates, flushes open documents, applies, echoes `rules`/`confirmUnhide`/`affected` |
+| `GET /admin/api/lobby` | live snapshot: `enabled`, `locked`, `pending`, `admitted` |
+| `POST /admin/api/lobby/:id/admit` | `{ "role": "editor" \| "viewer" }` → admits one pending request with that seat |
+| `POST /admin/api/lobby/:id/deny` | refuses one pending request; that connection becomes terminal |
+| `POST /admin/api/lobby/lock` | `{ "locked": true \| false }` → refuse or resume new joins |
+| `POST /admin/api/connections/:connectionId/kick` | closes that tab's doc/terminal/signal sockets with `4429` and makes its request terminal |
+| `GET /admin/api/events?token=…` | SSE: an opening `snapshot` event, then `lobby` on every change, with a 15 s heartbeat |
 
 Switching validates the path first, builds the new session before touching the old one, swaps
 atomically, then disposes the old one: dirty documents are flushed to their **old** absolute
@@ -200,6 +249,9 @@ The filesystem root, the home directory and its parents, and `~/.ssh`, `~/.aws`,
 ordinary files that every guest could read. System directories (`/etc`, `/usr`, `/bin`,
 `/sbin`, `/var`, `/System`, `/Library`, `/private`, `/dev`, `/proc`, matched exactly after
 realpath) are refused unless the request sets `"confirmBroad": true`.
+
+The lobby is rebuilt for the new root (pending requests and timers are dropped), while a
+kick still reaches a tab's sockets through the daemon-level connection registry.
 
 Guest tabs are not left silently broken: every document and terminal socket closes with
 `4410`, the app shows one toast — "The host switched to a different project. Reload to
@@ -251,7 +303,9 @@ slides up as an overlay.
 
 ## Security model (read before sharing a link)
 
-1. **Holding a token grants that token's role** — `owner` and `editor` may edit and, unless
+1. **Holding a token grants that token's role** — since 0.4.0 a guest token alone is not
+   enough: it must also be admitted by the Host unless the daemon runs with `--no-lobby`,
+   and the seat can only narrow that role. `owner` and `editor` may edit and, unless
    `--no-terminal`, run commands as the Host user; `viewer` may only read. Share tokens out
    of band; rotate by restarting the daemon (or passing different `--token` values). The
    client drops the stored token on a 401.
@@ -316,7 +370,9 @@ CODE_PAIR_ICE_SERVERS='[
 
 ## Testing
 
-Currently 164 server tests and 24 browser checks.
+Currently 183 server tests (12 files) and 24 browser checks. The join lobby and Host
+console were also exercised with a temporary headless-Chrome flow (waiting room → admit →
+workspace → kick → removed screen → lock → locked screen), which is not committed.
 
 ```bash
 npm run typecheck     # tsc for server + client
@@ -325,6 +381,9 @@ npm run build         # Vite client build + server tsc
 ```
 
 Browser-level checks live in `e2e/`:
+
+`browser.mjs` expects the daemon started with `--no-lobby`, because its flows assume guests
+are admitted immediately.
 
 ```bash
 cd e2e && npm install          # puppeteer-core

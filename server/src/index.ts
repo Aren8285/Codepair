@@ -17,6 +17,8 @@ Options:
                             (default: random per start)
   --editor-token <token>    Extra token with editor access (not read-only)
   --viewer-token <token>    Extra token with view-only access
+  --no-lobby                Admit every authenticated guest immediately
+  --lobby-timeout <sec>     Pending request lifetime, 1-3600 (default: 120)
   --allow-origin <origin>   Extra WebSocket origin allowed (repeatable)
   --no-terminal             Disable the remote terminal (explicit opt-out)
   --rule <glob=access>      Path rule: hidden, r or rw (repeatable, max 50)
