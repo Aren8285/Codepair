@@ -34,14 +34,21 @@ import { securityHeaders } from './security/headers.js';
 import { CAPABILITIES, can, type Principal } from './security/principal.js';
 import { SandboxError, type PathGuard } from './security/pathGuard.js';
 import type { Session } from './session/session.js';
-import { SessionManager } from './session/sessionManager.js';
-import { SignalingHub } from './signaling/signalingHub.js';
+import { RoomRegistry, type Room } from './rooms/roomRegistry.js';
 import { createTunnelState, type TunnelStatus } from './tunnelStatus.js';
 
 export { CAPABILITY_GATE, requireCap };
 export type { CapabilityGate } from './security/gate.js';
 
-export const SERVER_VERSION = '0.5.0';
+export const SERVER_VERSION = '0.6.0';
+
+declare global {
+  namespace Express {
+    interface Request {
+      room?: Room;
+    }
+  }
+}
 const MAX_WS_PAYLOAD = 2 * 1024 * 1024;
 
 /** Tags the `/api` authentication middleware (route audit). */
@@ -55,7 +62,7 @@ export interface CodepairServer {
   readonly root: string;
   readonly config: ServerConfig;
   readonly startedAt: number;
-  readonly sessions: SessionManager;
+  readonly sessions: RoomRegistry;
   /** Loopback-only Host console listener. */
   readonly admin: {
     readonly token: string;
@@ -94,49 +101,69 @@ export async function createCodepairServer(
   // Daemon-level socket registry: a kick must still reach a tab's sockets after
   // a root switch, when its seat lived in the disposed session's lobby.
   const connections = new ConnectionRegistry();
-  const track = (webSocket: WebSocket, connectionId: string | undefined): void => {
+  const track = (webSocket: WebSocket, roomId: string, connectionId: string | undefined): void => {
     if (!connectionId) return;
-    const untrack = connections.track(connectionId, webSocket);
+    const untrack = connections.track(roomId, connectionId, webSocket);
     webSocket.once('close', untrack);
   };
 
-  // Host console fan-out: the opening snapshot, then one event per lobby change.
-  const eventClients = new Set<Response>();
-  const lobbySnapshotJson = () => JSON.stringify(sessions.current().lobby.snapshot());
-  const broadcastLobby = (): void => {
-    for (const client of eventClients) {
+  // Host console fan-out: each stream is scoped to one room's lobby.
+  const eventClients = new Map<Response, string>();
+  const lobbySnapshotJson = (roomId: string): string => {
+    const room = sessions.get(roomId);
+    return JSON.stringify(
+      room?.session.lobby.snapshot() ?? { enabled: false, locked: true, admitted: 0, pending: [] },
+    );
+  };
+  const broadcastLobby = (roomId: string): void => {
+    for (const [client, clientRoomId] of eventClients) {
+      if (clientRoomId !== roomId) continue;
       try {
-        client.write(`event: lobby\ndata: ${lobbySnapshotJson()}\n\n`);
+        client.write(`event: lobby\ndata: ${lobbySnapshotJson(roomId)}\n\n`);
       } catch {
         eventClients.delete(client);
       }
     }
   };
-  const subscribeEvents = (response: Response): (() => void) => {
-    eventClients.add(response);
-    response.write(`event: snapshot\ndata: ${lobbySnapshotJson()}\n\n`);
+  const subscribeEvents = (response: Response, roomId: string): (() => void) => {
+    eventClients.set(response, roomId);
+    response.write(`event: snapshot\ndata: ${lobbySnapshotJson(roomId)}\n\n`);
     return () => {
       eventClients.delete(response);
     };
   };
+  const closeRoomEvents = (roomId: string): void => {
+    for (const [client, clientRoomId] of eventClients) {
+      if (clientRoomId !== roomId) continue;
+      eventClients.delete(client);
+      try {
+        client.end();
+      } catch {
+        // The client already went away.
+      }
+    }
+  };
 
-  // The one active session. `config.root` is read exactly here and nowhere else
-  // in the server; every request resolves the session it will use, once.
+  // The default room and every additional room share the daemon's socket and
+  // lifecycle infrastructure, but own their session, tokens and signalling.
   const tokenStore = new TokenStore(config.tokens);
-  const sessions = new SessionManager(config.root, {
-    saveDebounceMs: config.saveDebounceMs,
-    maxFileBytes: config.maxFileBytes,
-    terminalEnabled: config.terminalEnabled,
-    ignored,
-    lobby: { enabled: config.lobbyEnabled, timeoutMs: config.lobbyTimeoutMs, onChange: broadcastLobby },
-    inviteTokens: tokenStore,
-    inviteNow: options.inviteNow,
-  });
+  const sessions = new RoomRegistry(
+    config.roomId,
+    config.root,
+    tokenStore,
+    {
+      saveDebounceMs: config.saveDebounceMs,
+      maxFileBytes: config.maxFileBytes,
+      terminalEnabled: config.terminalEnabled,
+      ignored,
+      lobby: { enabled: config.lobbyEnabled, timeoutMs: config.lobbyTimeoutMs },
+      inviteNow: options.inviteNow,
+    },
+    broadcastLobby,
+  );
 
-  // Signalling is session-independent: rooms are stable for the daemon's life.
-  const signaling = new SignalingHub({ room: config.roomId });
-
-  const authenticate = options.authenticate ?? tokenStore.authenticate;
+  const authenticateForRoom = (room: Room) =>
+    room.isDefault && options.authenticate ? options.authenticate : room.tokens.authenticate;
   const tunnelState = createTunnelState(config.tunnelProvider);
   const tunnelStatus = options.tunnelStatus ?? (() => tunnelState.status());
   let boundPort = config.port;
@@ -162,10 +189,9 @@ export async function createCodepairServer(
     terminalBypassesRules: () => terminalBypassesRules(config),
     connections,
     subscribeEvents,
+    closeRoomEvents,
     clientDist: config.clientDist,
-    tokens: tokenStore,
     tunnelStatus,
-    roomId: config.roomId,
     guestOrigin,
   });
   const adminHttpServer = http.createServer(adminApp);
@@ -180,13 +206,31 @@ export async function createCodepairServer(
     response.json({ ok: true, version: SERVER_VERSION });
   });
 
+  // The room selector is resolved once per request. It chooses which token
+  // store authenticates the request; it is not itself a credential.
+  app.use('/api', (request, _response, next) => {
+    const raw = request.headers['x-codepair-room'];
+    if (Array.isArray(raw)) {
+      next(new AppError(404, 'ROOM_NOT_FOUND', 'That room does not exist.'));
+      return;
+    }
+    const roomId = typeof raw === 'string' && raw.length > 0 ? raw : config.roomId;
+    const room = sessions.get(roomId);
+    if (!room) {
+      next(new AppError(404, 'ROOM_NOT_FOUND', 'That room does not exist.'));
+      return;
+    }
+    request.room = room;
+    next();
+  });
+
   // Invite redemption is the one intentionally unauthenticated API route: the
   // whole point is to exchange a link for a token. It is rate-limited and
   // fail-closed inside InviteStore, and it grants no access by itself.
   app.post('/api/invites/:id/redeem', (request, response, next) => {
     response.setHeader('Cache-Control', 'no-store');
     try {
-      response.json(sessions.current().invites.redeem(request.params.id));
+      response.json(roomOf(request).session.invites.redeem(request.params.id));
     } catch (error) {
       next(error);
     }
@@ -198,7 +242,9 @@ export async function createCodepairServer(
     [API_AUTHENTICATION]: true;
   } = Object.assign(
     (request: Request, response: Response, next: NextFunction): void => {
-      const principal = authenticate(tokenFromAuthorizationHeader(request.headers.authorization));
+      const principal = authenticateForRoom(roomOf(request))(
+        tokenFromAuthorizationHeader(request.headers.authorization),
+      );
       if (!principal) {
         response.setHeader('WWW-Authenticate', 'Bearer');
         next(unauthorized());
@@ -213,7 +259,8 @@ export async function createCodepairServer(
   app.use('/api', authenticateApi);
 
   app.get('/api/session', (request, response) => {
-    const session = sessions.current();
+    const room = roomOf(request);
+    const session = room.session;
     // Reachable while waiting on purpose (the waiting screen needs it), and an
     // admitted seat can only narrow what this tab is told it may do.
     const principal = effectivePrincipal(session, principalOf(request), connectionIdOf(request));
@@ -227,7 +274,7 @@ export async function createCodepairServer(
       ),
       mode: can(principal, 'fs.write') ? 'read-write' : 'read-only',
       rootName: path.basename(session.root) || 'project',
-      roomId: config.roomId,
+      roomId: room.id,
       version: SERVER_VERSION,
       startedAt,
       limits: { maxFileBytes: config.maxFileBytes },
@@ -241,12 +288,14 @@ export async function createCodepairServer(
     '/api/lobby/join',
     requireCap('fs.read'),
     asyncRoute(async (request, response) => {
-      const session = sessions.current();
+      const room = roomOf(request);
+      const session = room.session;
       const principal = principalOf(request);
       const connectionId = connectionIdOf(request);
       if (!connectionId) {
         throw new AppError(403, 'LOBBY_REQUIRED', 'A connection id is required to join the lobby.');
       }
+      claimConnection(connections, room.id, connectionId);
       const body = asRecord(request.body);
       const displayName = typeof body.displayName === 'string' ? body.displayName : '';
       response.json(session.lobby.request(connectionId, displayName, guestRoleOf(principal)));
@@ -254,11 +303,13 @@ export async function createCodepairServer(
   );
 
   app.get('/api/lobby/status', requireCap('fs.read'), (request, response) => {
-    const session = sessions.current();
+    const room = roomOf(request);
+    const session = room.session;
     const connectionId = connectionIdOf(request);
     if (!connectionId) {
       throw new AppError(403, 'LOBBY_REQUIRED', 'A connection id is required to join the lobby.');
     }
+    claimConnection(connections, room.id, connectionId);
     response.json(session.lobby.status(connectionId, guestRoleOf(principalOf(request))));
   });
 
@@ -267,17 +318,19 @@ export async function createCodepairServer(
   // belong to an admitted entry, and its seat can only narrow the token's
   // capabilities. Anything unrecognized fails closed as "waiting".
   app.use('/api', (request, _response, next) => {
+    const room = roomOf(request);
+    const connectionId = connectionIdOf(request);
+    claimConnection(connections, room.id, connectionId);
     const principal = principalOf(request);
     if (principal.role === 'owner') {
       next();
       return;
     }
-    const session = sessions.current();
+    const session = room.session;
     if (!session.lobby.enabled) {
       next();
       return;
     }
-    const connectionId = connectionIdOf(request);
     if (!connectionId) {
       next(new AppError(403, 'LOBBY_REQUIRED', 'A connection id is required to use this API.'));
       return;
@@ -293,25 +346,25 @@ export async function createCodepairServer(
   });
 
   app.get('/api/tree', requireCap('fs.read'), asyncRoute(async (request, response) => {
-    const session = sessions.current();
+    const session = roomOf(request).session;
     const input = queryString(request.query.path, '');
     response.json(await session.access(principalOf(request)).tree(input));
   }));
 
   app.get('/api/file', requireCap('fs.read'), asyncRoute(async (request, response) => {
-    const session = sessions.current();
+    const session = roomOf(request).session;
     const input = requiredQuery(request.query.path);
     response.json(await session.access(principalOf(request)).read(input));
   }));
 
   app.get('/api/search', requireCap('fs.read'), asyncRoute(async (request, response) => {
-    const session = sessions.current();
+    const session = roomOf(request).session;
     const query = typeof request.query.q === 'string' ? request.query.q.slice(0, 200) : '';
     response.json(await session.access(principalOf(request)).search(query));
   }));
 
   app.post('/api/files', requireCap('fs.write'), asyncRoute(async (request, response) => {
-    const session = sessions.current();
+    const session = roomOf(request).session;
     const body = asRecord(request.body);
     const input = requireString(body.path, 'path');
     const type = body.type;
@@ -322,7 +375,7 @@ export async function createCodepairServer(
   }));
 
   app.post('/api/files/rename', requireCap('fs.write'), asyncRoute(async (request, response) => {
-    const session = sessions.current();
+    const session = roomOf(request).session;
     const body = asRecord(request.body);
     const from = requireString(body.from, 'from');
     const to = requireString(body.to, 'to');
@@ -333,7 +386,7 @@ export async function createCodepairServer(
   }));
 
   app.delete('/api/files', requireCap('fs.delete'), asyncRoute(async (request, response) => {
-    const session = sessions.current();
+    const session = roomOf(request).session;
     const input = typeof request.query.path === 'string' ? request.query.path : undefined;
     if (!input) throw badRequest('path query parameter is required.');
     session.documents.discardSubtree(input, 'This file was deleted.');
@@ -444,7 +497,18 @@ export async function createCodepairServer(
       return;
     }
 
-    const principal = authenticate(tokenFromWebSocketHeader(request.headers['sec-websocket-protocol']));
+    const requestedRoom = url.searchParams.get('room') ?? config.roomId;
+    const room = sessions.get(requestedRoom);
+    if (!room) {
+      rejectUpgrade(socket, 404, 'Not Found', 'Unknown room.');
+      return;
+    }
+
+    // Authenticate against the selected room's token store. The room selector is
+    // never a credential: a valid token from room A gets 401 in room B.
+    const principal = authenticateForRoom(room)(
+      tokenFromWebSocketHeader(request.headers['sec-websocket-protocol']),
+    );
     if (!principal) {
       rejectUpgrade(socket, 401, 'Unauthorized', 'A valid access token is required.');
       return;
@@ -456,7 +520,7 @@ export async function createCodepairServer(
 
     // One session for this upgrade: the lobby decision, the access check and
     // the connection below all belong to the same root selection.
-    const session = sessions.current();
+    const session = room.session;
     let upgradePrincipal = principal;
     let upgradeConnectionId: string | undefined;
     let refusal: string | undefined;
@@ -467,8 +531,9 @@ export async function createCodepairServer(
         session.lobby.connectDirect(rawConnectionId, 'Owner', 'owner');
       }
     } else if (!session.lobby.enabled) {
-      // No waiting room: every authenticated connection is admitted, and no
-      // connection id is needed (the pre-lobby suites run this way).
+      // No waiting room: every authenticated connection is admitted. A supplied
+      // connection id is still claimed so it cannot be borrowed by another room.
+      if (isConnectionId(rawConnectionId)) upgradeConnectionId = rawConnectionId;
     } else if (!isConnectionId(rawConnectionId)) {
       refusal = 'A connection id is required to join this room.';
     } else {
@@ -478,6 +543,13 @@ export async function createCodepairServer(
         upgradeConnectionId = rawConnectionId;
       } else {
         refusal = lobbyRefusalReason(session.lobby.status(rawConnectionId, guestRoleOf(principal)));
+      }
+    }
+
+    if (refusal === undefined && upgradeConnectionId) {
+      if (!connections.claim(upgradeConnectionId, room.id)) {
+        rejectUpgrade(socket, 403, 'Forbidden', 'That connection id belongs to a different room.');
+        return;
       }
     }
 
@@ -521,13 +593,13 @@ export async function createCodepairServer(
           await session.documents.prepare(docPath);
         } catch (error) {
           if (socket.destroyed) return;
-          if (session.documents.disposed || !isActiveSession(sessions, session)) {
+          if (session.documents.disposed || !isActiveSession(sessions, room, session)) {
             // The session went away mid-prepare. Complete the upgrade only to
             // close it with that session's code (4410 on a root switch), so the
             // client stops reconnecting instead of seeing a rejected upgrade.
             docWss.handleUpgrade(request, socket, head, (webSocket) => {
               docWss.emit('connection', webSocket, request);
-              track(webSocket, upgradeConnectionId);
+              track(webSocket, room.id, upgradeConnectionId);
               session.documents.connect(docPath, webSocket, decision.write, access.view);
             });
             return;
@@ -540,7 +612,7 @@ export async function createCodepairServer(
         if (socket.destroyed) return;
         docWss.handleUpgrade(request, socket, head, (webSocket) => {
           docWss.emit('connection', webSocket, request);
-          track(webSocket, upgradeConnectionId);
+          track(webSocket, room.id, upgradeConnectionId);
           session.documents.connect(docPath, webSocket, decision.write, access.view);
         });
       })();
@@ -554,25 +626,21 @@ export async function createCodepairServer(
       }
       terminalWss.handleUpgrade(request, socket, head, (webSocket) => {
         terminalWss.emit('connection', webSocket, request);
-        track(webSocket, upgradeConnectionId);
+        track(webSocket, room.id, upgradeConnectionId);
         session.terminals.handle(webSocket, upgradePrincipal);
       });
       return;
     }
 
     if (url.pathname === '/ws/signal') {
-      if (!signaling.acceptsRoom(url.searchParams.get('room'))) {
-        rejectUpgrade(socket, 404, 'Not Found', 'Unknown room.');
-        return;
-      }
       if (refusal !== undefined) {
         lobbyRefuse(signalWss, request, socket, head, refusal);
         return;
       }
       signalWss.handleUpgrade(request, socket, head, (webSocket) => {
         signalWss.emit('connection', webSocket, request);
-        track(webSocket, upgradeConnectionId);
-        signaling.handle(webSocket, upgradePrincipal);
+        track(webSocket, room.id, upgradeConnectionId);
+        room.signaling.handle(webSocket, upgradePrincipal, upgradeConnectionId);
       });
       return;
     }
@@ -641,8 +709,7 @@ export async function createCodepairServer(
     async close() {
       if (closed) return;
       closed = true;
-      await sessions.dispose();
-      signaling.dispose();
+      await sessions.disposeAll();
       connections.clear();
       for (const client of docWss.clients) client.terminate();
       for (const client of terminalWss.clients) client.terminate();
@@ -705,10 +772,10 @@ function firstLanAddress(): string | undefined {
   return undefined;
 }
 
-/** Is this session still the active one? Never throws during shutdown. */
-function isActiveSession(sessions: SessionManager, session: Session): boolean {
+/** Is this exact session still the active one for its room? */
+function isActiveSession(sessions: RoomRegistry, room: Room, session: Session): boolean {
   try {
-    return sessions.current() === session;
+    return sessions.isActive(room) && room.session === session;
   } catch {
     return false;
   }
@@ -805,6 +872,23 @@ function lobbyRefuse(
 function principalOf(request: Request): Principal {
   if (!request.principal) throw unauthorized();
   return request.principal;
+}
+
+/** The `/api` room resolver always sets this before authentication. */
+function roomOf(request: Request): Room {
+  if (!request.room) throw new AppError(500, 'ROOM_CONTEXT_MISSING', 'The room was not resolved.');
+  return request.room;
+}
+
+function claimConnection(
+  connections: ConnectionRegistry,
+  roomId: string,
+  connectionId: string | undefined,
+): void {
+  if (!connectionId) return;
+  if (!connections.claim(connectionId, roomId)) {
+    throw new AppError(403, 'ROOM_MISMATCH', 'That connection id belongs to a different room.');
+  }
 }
 
 function asRecord(value: unknown): Record<string, unknown> {

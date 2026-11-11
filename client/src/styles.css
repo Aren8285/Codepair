@@ -1657,6 +1657,32 @@ kbd {
   gap: 3px;
 }
 
+.videoTile__badge--hand {
+  color: var(--warn);
+}
+
+.videoTile__badge--hostMute {
+  width: auto;
+  padding: 0 5px;
+  font-size: 9px;
+  color: var(--danger);
+  background: rgba(5, 10, 16, 0.9);
+}
+
+.videoTile__spotlight {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: rgba(124, 140, 248, 0.9);
+  color: #06101a;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
 .videoTile__badge {
   display: inline-flex;
   align-items: center;
@@ -1690,6 +1716,116 @@ kbd {
   font-size: 10.5px;
   color: var(--muted);
   text-align: center;
+}
+
+.callDock__participants {
+  margin-top: 9px;
+  border-top: 1px solid var(--line);
+  padding-top: 8px;
+}
+
+.callDock__participantsHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 2px 6px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.callDock__participants ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 5px;
+}
+
+.participantRow {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 27px;
+  padding: 3px 4px;
+  border-radius: 6px;
+}
+
+.participantRow:hover {
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.participantRow__avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  font-size: 9px;
+  font-weight: 700;
+  flex: 0 0 auto;
+}
+
+.participantRow__name {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--text);
+}
+
+.participantRow__tag {
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  font-size: 8.5px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.participantRow__muted,
+.participantRow__hand {
+  display: inline-flex;
+  color: var(--muted);
+}
+
+.participantRow__hand {
+  color: var(--warn);
+}
+
+.participantRow__actions {
+  display: inline-flex;
+  gap: 2px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.participantRow__actions button,
+.linkButton {
+  border: none;
+  background: none;
+  padding: 2px 4px;
+  border-radius: 4px;
+  color: var(--accent-strong);
+  font-size: 9.5px;
+}
+
+.participantRow__actions button:hover,
+.linkButton:hover {
+  background: var(--accent-soft);
+}
+
+.participantRow__actions .participantRow__remove {
+  color: var(--danger);
 }
 
 .callDock__controls {
@@ -1727,6 +1863,12 @@ kbd {
   background: rgba(111, 208, 140, 0.14);
   border-color: rgba(111, 208, 140, 0.4);
   color: var(--ok);
+}
+
+.callControl.is-hand {
+  background: rgba(242, 184, 128, 0.14);
+  border-color: rgba(242, 184, 128, 0.4);
+  color: var(--warn);
 }
 
 .callControl--leave {

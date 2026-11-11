@@ -1,11 +1,11 @@
 # CodePair — Implementation Report
 
-Version 0.5.0 · macOS arm64 · Node v22.21.1 · npm 10.9.4
+Version 0.6.0 · macOS arm64 · Node v22.21.1 · npm 10.9.4
 
 Base report written at 0.2.0; §1 and §3 are kept current, and the addendum at the end
 records each iteration (0.3.x: host console API, host principal, path policy; 0.4.0: join
 lobby, kick/lock, Host console UI; 0.5.0: expiring invites, live token rotation, tunnel
-status/QR).
+status/QR; 0.6.0: room registry, room-scoped administration, call moderation).
 
 This report states what was built, what was actually verified (and how), what
 was not verified, and what remains. Nothing below is claimed as working on the
@@ -24,12 +24,15 @@ real processes, or real browser clients.
 | Responsive React + TS IDE | Built, verified | `client/src/*` |
 | Monaco integration | Built, verified | `client/src/lib/monaco.ts`, `components/EditorPane.tsx` |
 | Yjs collaboration + presence | Built, verified | `server/src/documents/documentHub.ts`, `client/src/lib/docProvider.ts` |
-| WebRTC signalling | Built, verified at signalling layer | `server/src/signaling/signalingHub.ts`, `client/src/lib/calls.ts` |
+| Room-scoped WebRTC signalling | Built, verified at signalling layer | `server/src/signaling/signalingHub.ts`, `client/src/lib/calls.ts` |
+| Call moderation | Built; server verified, UI not browser-exercised | `server/src/signaling/signalingHub.ts`, `client/src/lib/calls.ts`, `components/CallDock.tsx` |
 | WebRTC media (voice/video/screen) | Implemented, **not** verified end-to-end | `client/src/lib/calls.ts`, `components/CallDock.tsx` |
 | LAN connectivity | Built, verified | `server/src/index.ts` (`--host 0.0.0.0`) |
 | Public tunnel | Implemented, **not** verified | `server/src/tunnel.ts` |
 | Session URL + dynamic QR | Built, verified | `components/Dialogs.tsx` (`ShareDialog`) |
 | Loopback Host console API | Built, verified | `server/src/admin/adminApp.ts` |
+| Multi-room registry | Built, verified | `server/src/rooms/roomRegistry.ts` |
+| Room-scoped admin API | Built, verified | `server/src/admin/adminApp.ts` |
 | Host principal split (`host` vs. guest roles) | Built, verified | `server/src/security/principal.ts`, `server/src/server.ts` |
 | Join lobby (queue, lock, kick, seat ceiling) | Built, verified | `server/src/lobby/*`, `client/src/components/LobbyScreen.tsx` |
 | Host console UI (`/host`) | Built, verified | `client/src/host/*`, `client/host.html`, `server/src/admin/adminApp.ts` |
@@ -37,8 +40,8 @@ real processes, or real browser clients.
 | Expiring / limited-use invite links | Built, verified | `server/src/invites/invites.ts`, `server/src/admin/adminApp.ts` |
 | Live role-token rotation | Built, verified | `server/src/security/auth.ts`, `server/src/admin/adminApp.ts` |
 | Tunnel status + QR in Host console | Built; status verified, no live tunnel placed | `server/src/tunnelStatus.ts`, `client/src/host/HostQr.tsx` |
-| Automated tests | 206 server + 28 committed browser checks | `server/test/*`, `e2e/browser.mjs` |
-| Installation / environment docs | Written | `CLAUDE.md` |
+| Automated tests | 215 server + 28 committed browser checks | `server/test/*`, `e2e/browser.mjs` |
+| Installation / environment docs | Written | `AGENT.md` |
 | This report | Written | `REPORT.md` |
 
 ---
@@ -60,19 +63,23 @@ Host machine                                    Remote clients
 * **One process, no external services.** The daemon owns the HTTP server, the
   three WebSocket endpoints, the PTYs and the tunnel child process. There is no
   database: file contents on the Host are the source of truth.
+* **Rooms own sessions.** The default room is created from `--root`; the Host API can
+  create more rooms at other canonical roots. Each room has its own session, token store,
+  lobby, invites, document/PTY state and signalling hub. A room selector only chooses the
+  token store to check; it is not a credential, and connection ids cannot cross rooms.
 * **One Yjs document per file**, created lazily on first connection, torn down
   after the last client leaves (15 s idle).
-* **The token is the only credential**, generated per start with
+* **Each room has its own token store**, generated per start (or per room creation) with
   `crypto.randomBytes(32)`, compared in constant time, never placed in a URL
   query string (it rides in the WebSocket subprotocol instead).
 
-Full detail lives in [CLAUDE.md](CLAUDE.md).
+Full detail lives in [AGENT.md](AGENT.md).
 
 ---
 
 ## 3. Tests executed
 
-### Server suite — 206 tests, all passing
+### Server suite — 215 tests, all passing
 
 ```
 ✓ test/admin.test.ts       (26)  loopback guards, token separation, root switch, route audit, rotation, tunnel
@@ -83,11 +90,12 @@ Full detail lives in [CLAUDE.md](CLAUDE.md).
 ✓ test/policy.test.ts      (38)  matcher, floor, validation, choke point, live changes, 4403
 ✓ test/principal.test.ts   ( 9)  role matrix; owner never has session.admin
 ✓ test/session.test.ts     (21)  session lifecycle, switch/dispose, flush-to-old-root
-✓ test/signaling.test.ts   ( 5)  room isolation, payload caps, rate limits
+✓ test/signaling.test.ts   ( 8)  room isolation, payload caps, rate limits, moderation, live grants, call removal
 ✓ test/terminal.test.ts    ( 4)  read-only / --no-terminal / unauthenticated rejection, real PTY
 ✓ test/twoLaptop.test.ts   ( 2)  same-region typing bursts, reconnect convergence
 ✓ test/lobby.test.ts       (19)  queue, timeout, cap, lock, kick, seat ceiling, SSE, flags
 ✓ test/invites.test.ts     (15)  TTL, use caps, fail-closed errors, rate limit, tracker cap/soft cap
+✓ test/rooms.test.ts       ( 6)  creation, token isolation, selector-only auth, cross-room ids, room invites, scoped switch/delete
 ```
 
 Notable security assertions:
@@ -98,8 +106,12 @@ Notable security assertions:
 * `--mode read-only` blocks every mutating route server-side, drops Yjs updates
   with a `denied` control message, and closes the terminal with 4403.
 * `--no-terminal` closes `/ws/terminal` with 4403.
-* Signalling relays only within the session's room; SDP capped at 100 kB,
-  candidates at 4 kB, max 32 peers.
+* Signalling relays only within the selected room; SDP capped at 100 kB,
+  candidates at 4 kB, max 32 peers. A token from room A is 401 in room B, and a connection
+  id claimed in A is 403 in B, including the WebSocket upgrade.
+* Moderation is server-gated: only the owner or a live socket holding a host grant may
+  ask a target to mute, spotlight, raise hand or remove from the call. Call removal closes
+  only the signal socket with 4430.
 
 ### Browser harness — 28 checks, all passing
 
@@ -123,6 +135,8 @@ with real keystrokes. Verified end to end:
 | Invite redeems into the lobby and is admitted | guest reaches the workspace; fragment is cleared |
 | One redemption records one use | `usedCount = 1` under React StrictMode |
 | Reused invite is refused | the invite error screen appears, not a second seat |
+| Root switch across two tabs | exactly one toast across two tabs; reload lands in the new root |
+| Second root switch after toast expiry | a fresh toast appears for the second switch |
 | Share dialog | QR code + session link present |
 | Mobile layout (390×844) | no overflow, drawer collapsed, minimap disabled, no off-screen controls |
 | Landscape (844×390) | no overflow, editor usable |
@@ -132,6 +146,22 @@ A separate temporary headless-Chrome pass (lobby enabled, not committed as a tes
 the 0.4.0 flow: guest waiting room → Host console pending card over SSE → admit as editor →
 guest enters the workspace → kick → removed screen → lock → next guest sees the locked
 screen. 6/6 checks passed.
+
+### 0.6.0 rooms and moderation verification
+
+* **Room lifecycle.** Six integration tests cover creation with fresh tokens, selector-only
+  authentication, the same connection id in two rooms, room-local invites, a room-scoped
+  root switch, and deletion closing document/terminal/signal sockets with `4412` while the
+  default room stays protected.
+* **Moderation protocol.** Three signalling tests cover a moderator grant surviving only
+  its live socket, non-moderator `403 FORBIDDEN`, mute/spotlight/hand-raise relay semantics,
+  and call removal with `4430` leaving the document and terminal sockets open.
+* **Built-app browser run.** `e2e/browser.mjs` passed 28/28 against the built client and
+  server on room `e119-1687`: two Chrome contexts, persistence to disk, real terminal,
+  one-use invite/lobby admission, two root switches, mobile/landscape layout, no console or
+  page errors.
+* **Build/static.** `npm run typecheck` 0, `npm run build` 0, `git diff --check` 0. No new
+  dependencies were added.
 
 ### Build and static checks
 
@@ -245,6 +275,20 @@ and status-bar touch-target fixes shipped the same day.
 * A live public tunnel and QR were not exercised because no tunnel URL existed; the QR
   renderer is the same tested `qrcode` path used by the guest Share dialog.
 
+**Rooms and moderation (0.6.0)**
+
+* The 28-check browser run used the default room. Multi-room isolation is verified by the
+  six server integration tests, not by a second browser context in another room.
+* The participant drawer (ask-to-mute, spotlight, hand raise, remove) is compiled,
+  typechecked and included in the build, but its visual interaction was not exercised by
+  the browser harness. The signalling protocol and error paths are covered by tests.
+* A moderation grant is in-memory state on one live signal socket. A disconnect, restart or
+  reconnect with the same connection id requires a fresh Host grant.
+* Host transfer was intentionally omitted: it conflicts with the rule that guest tokens are
+  rejected on the admin listener. There is no `transfer-owner` route.
+* Room definitions, tokens, lobbies, invites and moderation state are in memory and do not
+  survive a daemon restart. Room creation returns tokens once; lost tokens must be rotated.
+
 **Access policy — deliberate limits (0.3.2)**
 
 * A hidden file is hidden from the app, not from a shell: terminal clients run as the Host
@@ -312,21 +356,20 @@ and status-bar touch-target fixes shipped the same day.
 ```bash
 npm install
 npm run typecheck      # 0
-npm test               # 206 passing
+npm test               # 215 passing
 npm run build          # 0
 
-# Terminal 1 — Host daemon
-npm run dev -w server -- --root /path/to/project --no-lobby   # browser.mjs assumes open joins
-# Terminal 2 — UI
-npm run dev -w client            # http://localhost:5180
-
-# Terminal 3 — browser harness (needs Chrome + puppeteer-core)
+# Terminal 1 — built Host daemon
+npm start -- --root /path/to/project
+# Terminal 2 — browser harness (needs Chrome + puppeteer-core)
 cd e2e && npm install
-CODE_PAIR_URL='http://localhost:5180/room/<id>#token=<token>' \
+CODE_PAIR_URL='http://127.0.0.1:7420/room/<id>#token=<owner-token>' \
 CODE_PAIR_PROJECT=/path/to/project \
 CODE_PAIR_FILE='README.md' \
-CODE_PAIR_TOKEN='<token>' \
-node browser.mjs                 # 28 checks
+CODE_PAIR_TOKEN='<owner-token>' \
+CODE_PAIR_ADMIN_TOKEN='<host-console-token>' \
+CODE_PAIR_ADMIN_URL='http://127.0.0.1:7421' \
+node browser.mjs                 # 28 checks, including root switches and invites
 ```
 
 ---
@@ -403,25 +446,22 @@ anyone with the token can do anything the host user can (§5 "Security posture")
 
 ### 8.3 Rooms like Google Meet
 
-**Current state:** one room per daemon launch; the call is a P2P mesh with
-signalling relayed by the host; no lobby, no moderation, no chat.
+**Current state (0.6.0):** the daemon has a default room plus admin-created
+rooms, each with its own tokens, lobby, invites, root and signalling hub. Moderation
+supports ask-to-mute, spotlight, hand raise and remove-from-call; call removal leaves the
+editor and terminal connected. There is no room-management UI, chat or host transfer yet.
 
 **Plan:**
 
-1. **Server-side room registry** in the daemon (rooms outlive the current
-   single-room model): roomId → participants (presence, roles
-   host/presenter/guest), join/leave events, live roster delivered by the
-   signalling hub.
-2. **Lobby & admission:** host approves joins from a waiting screen; a locked
-   room blocks new joins; media permission is requested via the lobby rather
-   than auto-granted.
-3. **Moderator controls (host):** mute anyone (server-enforced track disable
-   via signalling), spotlight/pin a participant, lock the room, end the call
-   for everyone, kick, and host-transfer on exit.
-4. **In-call surfaces:** participant drawer (roles + device states), pinned
-   speaker view (dominant-audio detection is already feasible client-side),
-   hand raise, ephemeral emoji reactions (awareness messages), call chat
+1. **Room management UI:** create, list, select, switch and delete rooms from `/host`
+   instead of the admin API only, including one-time token handoff and room roots.
+2. **Host transfer:** design a new authorization path that still keeps guest tokens off
+   the admin listener; the current design deliberately omits it.
+3. **In-call surfaces:** pinned speaker view (dominant-audio detection is feasible
+   client-side), ephemeral emoji reactions (awareness messages), and call chat
    (signalling-relayed, not persisted).
+4. **Media verification:** exercise a real two-device call with fake and physical devices;
+   add TURN where needed.
 5. **Scale path:** keep the mesh to ~6 participants; consider an SFU (or a
    self-hosted one like LiveKit) only when actual user counts demand it.
 
@@ -478,8 +518,8 @@ renders what the server allows.
 2. **Mode-aware client:** a `ProfileProvider` picks the layout and lazy-loads
    the module's feature strips (interview clock, kiosk grid, roster) so the
    pair-coding bundle doesn't grow.
-3. **Per-room profiles (phase 2)** once §8.3's room registry exists — one
-   daemon hosts several rooms with different postures at once.
+3. **Per-room profiles (phase 2)** — the room registry now exists; the next step is
+   attaching a profile to each room so one daemon can host several postures at once.
 4. **Authoritative server:** all mode enforcement stays server-side (path
    guard flags, terminal gating, call scope); the UI is cosmetic only.
 
@@ -489,7 +529,8 @@ renders what the server allows.
    safely from anywhere" gates everything else.
 2. **§8.4 host/joiner split** — Meet-style moderation UI (§8.3) needs the host
    console to live in.
-3. **§8.3 Meet-style rooms** — registry, lobby, moderation, chat.
+3. **§8.3 Meet-style rooms** — finish room management UI, host transfer and chat on top
+   of the shipped registry, lobby and moderation.
 4. **§8.5 profiles** — interview mode first (tightest real use-case), then
    system-sharing kiosk, then teaching.
 5. **§8.1 deep track (self-hosted relay, P2P data channels, TURN)** —
@@ -607,3 +648,36 @@ fallback) — that decision decides how much of §8.2 lands in phase 1 vs phase 
   status with `cloudflared` detected as installed. No new server dependencies. PathGuard,
   FileService policy, Yjs sync internals, WebRTC/signalling payloads, lobby admission/kick/
   lock semantics, 0.3.x admin-listener guards, and `tunnel.ts` spawn/scrape were unchanged.
+
+### 0.6.0 — rooms and call moderation (2026-11-11)
+
+* **Room registry.** `RoomRegistry` owns the default room and any admin-created rooms.
+  Each room has its own `Session`, `TokenStore`, lobby, invites, document/PTY state and
+  `SignalingHub`; lifecycle operations are serialized. New rooms get fresh owner/editor/
+  viewer tokens, return them once, and cannot reuse a canonical root already open elsewhere.
+* **Fail-closed isolation.** `X-CodePair-Room` / `?room=` only selects the room. Tokens,
+  invites, lobbies and root switches are room-local. A connection id is claimed once and
+  rejected in another room with `403 ROOM_MISMATCH` on HTTP and WebSocket upgrades.
+* **Admin surface.** Room routes cover list/create/delete, state, policy, lobby,
+  kick, invites, token rotation, room root switching, room events and moderator grants.
+  The default routes remain compatible. Deleting a room closes its documents, terminals and
+  signals with `4412`, ends its SSE stream, releases claims and refuses default/last-room
+  deletion (`409`).
+* **Moderation.** Signal messages add `mute-request`, `spotlight`, `hand-raise` and
+  `kick-from-call`. Owner `call.moderate` or a host grant tied to a live connection id
+  authorizes them. Mute is relayed to the target only and never changes server-side mic
+  state; spotlight and hand raise broadcast, and call removal closes only the signal socket
+  with `4430` so the target can rejoin or keep editing.
+* **Client.** Room ids now travel on API, invite, document and terminal requests as well as
+  calls. `CallDock` adds a participant drawer, spotlight emphasis, hand raise, moderator
+  actions and a "Muted by host" badge that appears only after the local audio track is
+  disabled.
+* **Verified.** 215/215 server tests in 14 files (six room tests, three moderation tests;
+  the original 206 remain green), typecheck 0, build 0, diff check 0, and 28/28 real-Chrome
+  checks against the built app on room `e119-1687`. The browser run covered two clients,
+  disk persistence, terminal, invites/lobby, root switches and responsive layout.
+* **Limitations.** The participant drawer was not browser-exercised; multi-room browser
+  coverage is absent (server integration covers it); host transfer is omitted by design;
+  room and moderation state are in memory. No new dependencies. PathGuard, FileService
+  policy internals, Yjs internals, WebRTC media negotiation, 0.4.0 lobby semantics and the
+  0.3.x admin-listener guards were not changed.

@@ -4,7 +4,7 @@ export type AccessMode = 'read-only' | 'read-write';
 
 export type Role = 'owner' | 'editor' | 'viewer';
 
-export type Capability = 'fs.read' | 'fs.write' | 'fs.delete' | 'term.use' | 'call.join' | 'session.admin';
+export type Capability = 'fs.read' | 'fs.write' | 'fs.delete' | 'term.use' | 'call.join' | 'call.moderate' | 'session.admin';
 
 export interface IceServer {
   urls: string | string[];
@@ -106,12 +106,19 @@ export interface RedeemedInvite {
 }
 
 /** Exchange an invite link for a real guest token. Unauthenticated by design. */
-export async function redeemInvite(id: string, signal?: AbortSignal): Promise<RedeemedInvite> {
+export async function redeemInvite(
+  id: string,
+  roomId?: string | null,
+  signal?: AbortSignal,
+): Promise<RedeemedInvite> {
   let response: Response;
   try {
     response = await fetch(`/api/invites/${encodeURIComponent(id)}/redeem`, {
       method: 'POST',
-      headers: { Accept: 'application/json' },
+      headers: {
+        Accept: 'application/json',
+        ...(roomId ? { 'X-CodePair-Room': roomId } : {}),
+      },
       signal,
     });
   } catch (error) {
@@ -144,7 +151,10 @@ export async function redeemInvite(id: string, signal?: AbortSignal): Promise<Re
 }
 
 export class ApiClient {
-  constructor(private readonly token: string) {}
+  constructor(
+    private readonly token: string,
+    private readonly roomId?: string,
+  ) {}
 
   session(signal?: AbortSignal): Promise<SessionInfo> {
     return this.request<SessionInfo>('/api/session', { signal });
@@ -203,6 +213,9 @@ export class ApiClient {
         headers: {
           Accept: 'application/json',
           Authorization: `Bearer ${this.token}`,
+          // The selector is not a credential: the token is checked against this
+          // room's store. Omitting it targets the default room.
+          ...(this.roomId ? { 'X-CodePair-Room': this.roomId } : {}),
           // One id per tab: the Host's admission (and its seat) is keyed on it.
           'X-CodePair-Connection': currentConnectionId(),
           ...(init.headers ?? {}),
@@ -251,6 +264,10 @@ export function describeApiError(error: unknown): string {
         return error.message;
       case 'UNAUTHORIZED':
         return 'Your access token was rejected. Reconnect with a valid link.';
+      case 'ROOM_NOT_FOUND':
+        return 'That room is no longer open on this host.';
+      case 'ROOM_MISMATCH':
+        return 'This tab is already connected to a different room. Open a fresh tab for this link.';
       default:
         return error.message;
     }

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useSyncExternalStore, type PointerEvent as ReactPointerEvent } from 'react';
-import type { CallManager, CallPeer } from '../lib/calls';
+import type { CallManager, CallPeer, CallSnapshot } from '../lib/calls';
 import { Icon } from './Icon';
 
 interface CallDockProps {
@@ -14,6 +14,7 @@ export function CallDock({ manager, open, onOpenChange }: CallDockProps) {
   const snapshot = useSyncExternalStore(manager.subscribe, manager.getSnapshot);
   const [minimized, setMinimized] = useState(false);
   const [maximized, setMaximized] = useState(false);
+  const [participantsOpen, setParticipantsOpen] = useState(false);
   const [position, setPosition] = useState<{ left: number; top: number } | null>(null);
   const dockRef = useRef<HTMLElement>(null);
   const dragRef = useRef<{ pointerId: number; startX: number; startY: number; left: number; top: number; width: number; height: number } | null>(null);
@@ -23,6 +24,7 @@ export function CallDock({ manager, open, onOpenChange }: CallDockProps) {
     if (!active) {
       setMinimized(false);
       setMaximized(false);
+      setParticipantsOpen(false);
       setPosition(null);
     }
   }, [active]);
@@ -99,10 +101,18 @@ export function CallDock({ manager, open, onOpenChange }: CallDockProps) {
     dragRef.current = null;
   };
 
-  // Give an active screen share the largest slot in the grid so it stays readable.
-  const featuredId: string | null = snapshot.screenSharing
-    ? 'self'
-    : (snapshot.peers.find((peer) => peer.screen)?.id ?? null);
+  // A host spotlight wins over a screen share; otherwise an active share gets
+  // the largest slot so the content stays readable.
+  const spotlightPeer =
+    snapshot.spotlightId && snapshot.spotlightId !== snapshot.selfId
+      ? snapshot.peers.find((peer) => peer.id === snapshot.spotlightId)
+      : undefined;
+  const featuredId: string | null =
+    snapshot.spotlightId === snapshot.selfId || spotlightPeer
+      ? (snapshot.spotlightId ?? null)
+      : snapshot.screenSharing
+        ? 'self'
+        : (snapshot.peers.find((peer) => peer.screen)?.id ?? null);
 
   const statusLabel =
     snapshot.status === 'connecting'
@@ -143,6 +153,17 @@ export function CallDock({ manager, open, onOpenChange }: CallDockProps) {
           </p>
         </div>
         <div className="callDock__headActions">
+          {active ? (
+            <button
+              className={`icon-button${participantsOpen ? ' is-on' : ''}`}
+              onClick={() => setParticipantsOpen((value) => !value)}
+              aria-pressed={participantsOpen}
+              aria-label="Show call participants"
+              title="Participants"
+            >
+              <Icon name="users" size={15} />
+            </button>
+          ) : null}
           <button
             className={`icon-button${maximized ? ' is-on' : ''}`}
             onClick={() => {
@@ -200,6 +221,9 @@ export function CallDock({ manager, open, onOpenChange }: CallDockProps) {
               screen={snapshot.screenSharing}
               connection="connected"
               featured={featuredId === 'self'}
+              handRaised={snapshot.handRaised}
+              mutedByHost={snapshot.mutedByHost}
+              spotlighted={snapshot.spotlightId === snapshot.selfId}
             />
             {snapshot.peers.map((peer) => (
               <VideoTile
@@ -212,6 +236,8 @@ export function CallDock({ manager, open, onOpenChange }: CallDockProps) {
                 screen={peer.screen}
                 connection={peer.connection}
                 featured={featuredId === peer.id}
+                handRaised={peer.handRaised}
+                spotlighted={snapshot.spotlightId === peer.id}
               />
             ))}
           </div>
@@ -219,6 +245,8 @@ export function CallDock({ manager, open, onOpenChange }: CallDockProps) {
           {snapshot.peers.length === 0 ? (
             <p className="callDock__waiting">Waiting for others to join the call…</p>
           ) : null}
+
+          {participantsOpen ? <ParticipantsPanel snapshot={snapshot} manager={manager} /> : null}
 
           <div className="callDock__controls">
             <button
@@ -248,6 +276,15 @@ export function CallDock({ manager, open, onOpenChange }: CallDockProps) {
             >
               <Icon name={snapshot.screenSharing ? 'screen-off' : 'screen'} size={16} />
             </button>
+            <button
+              className={`callControl${snapshot.handRaised ? ' is-hand' : ''}`}
+              onClick={() => manager.toggleHand()}
+              aria-pressed={snapshot.handRaised}
+              aria-label={snapshot.handRaised ? 'Lower hand' : 'Raise hand'}
+              title={snapshot.handRaised ? 'Lower hand' : 'Raise hand'}
+            >
+              <Icon name="hand" size={16} />
+            </button>
             <button className="callControl callControl--leave" onClick={() => manager.leave()} aria-label="Leave call" title="Leave call">
               <Icon name="phone-off" size={16} />
             </button>
@@ -255,6 +292,55 @@ export function CallDock({ manager, open, onOpenChange }: CallDockProps) {
         </div>
       )}
     </aside>
+  );
+}
+
+function ParticipantsPanel({ snapshot, manager }: { snapshot: CallSnapshot; manager: CallManager }) {
+  return (
+    <section className="callDock__participants" aria-label="Call participants">
+      <div className="callDock__participantsHead">
+        <span>Participants</span>
+        {snapshot.moderator && snapshot.spotlightId ? (
+          <button className="linkButton" onClick={() => manager.spotlight(null)}>
+            Clear spotlight
+          </button>
+        ) : null}
+      </div>
+      <ul>
+        <li className="participantRow">
+          <span className="participantRow__avatar" style={{ background: '#7c8cf822', color: '#7c8cf8' }}>
+            {initials('You')}
+          </span>
+          <span className="participantRow__name">You</span>
+          {snapshot.mutedByHost ? <span className="participantRow__tag">Muted by host</span> : null}
+          {snapshot.handRaised ? <Icon name="hand" size={13} /> : null}
+          {snapshot.moderator ? <span className="participantRow__tag">Moderator</span> : null}
+        </li>
+        {snapshot.peers.map((peer) => (
+          <li className="participantRow" key={peer.id}>
+            <span className="participantRow__avatar" style={{ background: `${peer.color}22`, color: peer.color }}>
+              {initials(peer.name)}
+            </span>
+            <span className="participantRow__name">
+              {peer.name}
+              {!peer.mic ? <span className="participantRow__muted" title="Muted"><Icon name="mic-off" size={12} /></span> : null}
+              {peer.handRaised ? <span className="participantRow__hand" title="Hand raised"><Icon name="hand" size={12} /></span> : null}
+            </span>
+            {snapshot.moderator ? (
+              <span className="participantRow__actions">
+                <button onClick={() => manager.requestMute(peer.id)}>Ask to mute</button>
+                <button onClick={() => manager.spotlight(peer.id)}>
+                  {snapshot.spotlightId === peer.id ? 'Unspotlight' : 'Spotlight'}
+                </button>
+                <button className="participantRow__remove" onClick={() => manager.removeFromCall(peer.id)}>
+                  Remove
+                </button>
+              </span>
+            ) : null}
+          </li>
+        ))}
+      </ul>
+    </section>
   );
 }
 
@@ -269,6 +355,9 @@ function VideoTile({
   screen,
   connection,
   featured = false,
+  handRaised = false,
+  mutedByHost = false,
+  spotlighted = false,
 }: {
   stream: MediaStream | null;
   name: string;
@@ -280,6 +369,9 @@ function VideoTile({
   screen: boolean;
   connection: RTCPeerConnectionState | 'new' | 'connected';
   featured?: boolean;
+  handRaised?: boolean;
+  mutedByHost?: boolean;
+  spotlighted?: boolean;
 }) {
   const tileRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -357,6 +449,7 @@ function VideoTile({
           Tap to hear
         </button>
       ) : null}
+      {spotlighted ? <span className="videoTile__spotlight">Spotlight</span> : null}
       {stream && hasVideo ? (
         <button
           className="videoTile__fs"
@@ -372,7 +465,9 @@ function VideoTile({
       </span>
       <span className="videoTile__badges">
         {screen ? <span className="videoTile__badge" title="Sharing screen"><Icon name="screen" size={11} /></span> : null}
+        {handRaised ? <span className="videoTile__badge videoTile__badge--hand" title="Hand raised"><Icon name="hand" size={11} /></span> : null}
         {!mic ? <span className="videoTile__badge videoTile__badge--off" title="Muted"><Icon name="mic-off" size={11} /></span> : null}
+        {mutedByHost ? <span className="videoTile__badge videoTile__badge--hostMute">Muted by host</span> : null}
         {!cam && !screen ? <span className="videoTile__badge videoTile__badge--off" title="Camera off"><Icon name="video-off" size={11} /></span> : null}
         {connection === 'failed' || connection === 'disconnected' ? (
           <span className="videoTile__badge videoTile__badge--off" title="Connection problem">

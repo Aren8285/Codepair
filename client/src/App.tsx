@@ -47,14 +47,18 @@ type InviteState = 'idle' | 'redeeming' | 'error';
  */
 const inviteRedemptions = new Map<string, Promise<{ token: string; role: 'editor' | 'viewer' }>>();
 
-function redeemInviteOnce(id: string): Promise<{ token: string; role: 'editor' | 'viewer' }> {
-  const existing = inviteRedemptions.get(id);
+function redeemInviteOnce(
+  id: string,
+  roomId: string | null,
+): Promise<{ token: string; role: 'editor' | 'viewer' }> {
+  const key = `${roomId ?? ''}:${id}`;
+  const existing = inviteRedemptions.get(key);
   if (existing) return existing;
-  const pending = redeemInvite(id).catch((error: unknown) => {
-    inviteRedemptions.delete(id);
+  const pending = redeemInvite(id, roomId).catch((error: unknown) => {
+    inviteRedemptions.delete(key);
     throw error;
   });
-  inviteRedemptions.set(id, pending);
+  inviteRedemptions.set(key, pending);
   return pending;
 }
 
@@ -81,14 +85,17 @@ export function App() {
   const [retryKey, setRetryKey] = useState(0);
   const [routeRoom, setRouteRoom] = useState<string | null>(() => roomFromPath(window.location.pathname));
   const [malformedRoom] = useState(() => window.location.pathname.startsWith('/room/') && roomFromPath(window.location.pathname) === null);
-  const api = useMemo(() => (token ? new ApiClient(token) : null), [token]);
+  const api = useMemo(
+    () => (token ? new ApiClient(token, routeRoom ?? undefined) : null),
+    [token, routeRoom],
+  );
 
   useEffect(() => {
     if (!inviteId) return;
     let cancelled = false;
     setInviteState('redeeming');
     setInviteError('');
-    redeemInviteOnce(inviteId)
+    redeemInviteOnce(inviteId, routeRoom)
       .then(({ token: nextToken }) => {
         if (cancelled) return;
         storeToken(nextToken);
@@ -105,7 +112,7 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [inviteId, inviteAttempt]);
+  }, [inviteId, inviteAttempt, routeRoom]);
 
   // Admission state. `checking` is the moment between "token accepted" and the
   // Host's answer; `admitted` is the only view that renders the workspace.
@@ -398,12 +405,12 @@ function Workspace({
     () =>
       new CallManager({
         token,
-        roomId: session.roomId,
+        roomId,
         iceServers: session.rtc.iceServers,
         self,
         onToast: (kind, message, detail) => notify(kind, message, detail),
       }),
-    [token, session.roomId, session.rtc.iceServers, self, notify],
+    [token, roomId, session.rtc.iceServers, self, notify],
   );
 
   useEffect(() => () => callManager.destroy(), [callManager]);
@@ -799,6 +806,7 @@ function Workspace({
                 <EditorPane
                   key={path}
                   token={token}
+                  roomId={roomId}
                   path={path}
                   active={path === activePath}
                   readOnly={readOnly}
@@ -814,7 +822,7 @@ function Workspace({
           </div>
 
           {terminalOpen ? (
-            <TerminalPanel token={token} rootName={session.rootName} onClose={() => setTerminalOpen(false)} onToast={(kind, message, detail) => notify(kind, message, detail)} />
+            <TerminalPanel token={token} roomId={roomId} rootName={session.rootName} onClose={() => setTerminalOpen(false)} onToast={(kind, message, detail) => notify(kind, message, detail)} />
           ) : null}
 
           <StatusBar

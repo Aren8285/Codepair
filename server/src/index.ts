@@ -50,7 +50,7 @@ async function main(): Promise<void> {
     return;
   }
   if (argv.includes('--version')) {
-    process.stdout.write('0.5.0\n');
+    process.stdout.write('0.6.0\n');
     return;
   }
 

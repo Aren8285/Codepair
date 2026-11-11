@@ -10,6 +10,7 @@ import type { CursorState, EditorStatus, Participant } from '../lib/status';
 
 interface EditorPaneProps {
   token: string;
+  roomId: string;
   path: string;
   active: boolean;
   readOnly: boolean;
@@ -25,6 +26,7 @@ const isDesktop = () => window.matchMedia('(min-width: 900px)').matches;
 
 export function EditorPane({
   token,
+  roomId,
   path,
   active,
   readOnly,
@@ -98,6 +100,7 @@ export function EditorPane({
 
     const provider = new DocProvider({
       token,
+      roomId,
       path,
       user: currentPresence(),
       onStatus: (state) => {

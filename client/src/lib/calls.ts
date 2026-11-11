@@ -10,6 +10,7 @@ export interface CallPeer {
   mic: boolean;
   cam: boolean;
   screen: boolean;
+  handRaised: boolean;
   connection: RTCPeerConnectionState | 'new';
   stream: MediaStream | null;
 }
@@ -22,6 +23,13 @@ export interface CallSnapshot {
   micEnabled: boolean;
   camEnabled: boolean;
   screenSharing: boolean;
+  /** Host-granted moderation for this live signal socket. */
+  moderator: boolean;
+  /** Peer the host is featuring, or null. */
+  spotlightId: string | null;
+  handRaised: boolean;
+  /** The local audio track was disabled by a host request, not by this user. */
+  mutedByHost: boolean;
   peers: CallPeer[];
   error?: string;
 }
@@ -58,8 +66,15 @@ const INITIAL: CallSnapshot = {
   micEnabled: false,
   camEnabled: false,
   screenSharing: false,
+  moderator: false,
+  spotlightId: null,
+  handRaised: false,
+  mutedByHost: false,
   peers: [],
 };
+
+/** Closing code for a call-only removal; the tab can immediately rejoin. */
+const CALL_REMOVED_CLOSE_CODE = 4430;
 
 /**
  * Mesh WebRTC calls for one room.
@@ -121,6 +136,10 @@ export class CallManager {
         micEnabled: Boolean(this.audioTrack?.enabled),
         camEnabled: Boolean(this.cameraTrack?.enabled),
         screenSharing: false,
+        moderator: false,
+        spotlightId: null,
+        handRaised: false,
+        mutedByHost: false,
         error: undefined,
       });
       this.connectSocket();
@@ -155,8 +174,35 @@ export class CallManager {
       return;
     }
     this.audioTrack.enabled = !this.audioTrack.enabled;
-    this.replaceSnapshot({ micEnabled: this.audioTrack.enabled });
+    this.replaceSnapshot({
+      micEnabled: this.audioTrack.enabled,
+      mutedByHost: this.audioTrack.enabled ? false : this.snapshot.mutedByHost,
+    });
     this.broadcastState();
+  }
+
+  toggleHand(): void {
+    const raised = !this.snapshot.handRaised;
+    this.replaceSnapshot({ handRaised: raised });
+    this.sendToSocket({ type: 'hand-raise', raised });
+  }
+
+  /** Moderator action: ask one participant's client to mute its own track. */
+  requestMute(peerId: string): void {
+    if (!this.snapshot.moderator) return;
+    this.sendToSocket({ type: 'mute-request', to: peerId });
+  }
+
+  /** Moderator action: feature one participant, or clear with null. */
+  spotlight(peerId: string | null): void {
+    if (!this.snapshot.moderator) return;
+    this.sendToSocket({ type: 'spotlight', to: peerId });
+  }
+
+  /** Moderator action: close only that participant's call socket. */
+  removeFromCall(peerId: string): void {
+    if (!this.snapshot.moderator) return;
+    this.sendToSocket({ type: 'kick-from-call', to: peerId });
   }
 
   async toggleCamera(): Promise<void> {
@@ -253,12 +299,27 @@ export class CallManager {
       void this.handleMessage(message);
     };
 
-    socket.onclose = () => {
+    socket.onclose = (event) => {
       if (this.socket !== socket) return;
       this.socket = undefined;
       if (this.destroyed || this.leaving) return;
-      this.closeAllPeers();
-      this.replaceSnapshot({ status: 'reconnecting', peers: [] });
+      if (event.code === CALL_REMOVED_CLOSE_CODE) {
+        // Call-only removal: stop media and let this tab start a fresh call. The
+        // document and terminal sockets are deliberately untouched.
+        this.closeAllPeers();
+        this.stopScreenTracks();
+        this.stopLocalMedia();
+        this.selfId = null;
+        this.replaceSnapshot({ ...INITIAL, status: 'idle' });
+        this.options.onToast?.(
+          'warning',
+          'Removed from the call',
+          'The host removed you from this call. You can rejoin any time.',
+        );
+        return;
+      }
+      this.clearCallState();
+      this.replaceSnapshot({ status: 'reconnecting', peers: [], moderator: false, spotlightId: null });
       this.scheduleReconnect();
     };
   }
@@ -266,10 +327,17 @@ export class CallManager {
   private async handleMessage(message: Record<string, unknown>): Promise<void> {
     switch (message.type) {
       case 'joined': {
-        this.selfId = (message.self as { id: string } | undefined)?.id ?? null;
+        const self = message.self as { id?: string; handRaised?: boolean } | undefined;
+        this.selfId = self?.id ?? null;
         const peers = (message.peers as Array<Record<string, unknown>> | undefined) ?? [];
         for (const peer of peers) this.ensurePeer(peer);
-        this.replaceSnapshot({ status: 'active', selfId: this.selfId });
+        this.replaceSnapshot({
+          status: 'active',
+          selfId: this.selfId,
+          moderator: message.moderator === true,
+          spotlightId: typeof message.spotlight === 'string' ? message.spotlight : null,
+          handRaised: self?.handRaised === true,
+        });
         return;
       }
       case 'peer-joined': {
@@ -290,6 +358,38 @@ export class CallManager {
         runtime.info.cam = message.cam === true;
         runtime.info.screen = message.screen === true;
         this.publishPeers();
+        return;
+      }
+      case 'spotlight': {
+        this.replaceSnapshot({
+          spotlightId: typeof message.peerId === 'string' ? message.peerId : null,
+        });
+        return;
+      }
+      case 'hand-raise': {
+        const from = typeof message.from === 'string' ? message.from : '';
+        const raised = message.raised === true;
+        const runtime = this.peers.get(from);
+        if (runtime) {
+          runtime.info.handRaised = raised;
+          this.publishPeers();
+        }
+        if (from === this.selfId) this.replaceSnapshot({ handRaised: raised });
+        return;
+      }
+      case 'moderator': {
+        if (message.granted === true) {
+          this.replaceSnapshot({ moderator: true });
+          this.options.onToast?.(
+            'info',
+            'You can moderate this call',
+            'Mute requests ask each participant to turn their own microphone off.',
+          );
+        }
+        return;
+      }
+      case 'mute-request': {
+        this.honorMuteRequest();
         return;
       }
       case 'signal': {
@@ -323,6 +423,7 @@ export class CallManager {
       mic: raw.mic !== false,
       cam: raw.cam !== false,
       screen: raw.screen === true,
+      handRaised: raw.handRaised === true,
       connection: 'new',
       stream: null,
     };
@@ -472,11 +573,25 @@ export class CallManager {
       for (const runtime of this.peers.values()) {
         await runtime.pc.addTrack(track, this.localStream ?? stream);
       }
-      this.replaceSnapshot({ micEnabled: true });
+      this.replaceSnapshot({ micEnabled: true, mutedByHost: false });
       this.broadcastState();
     } catch (error) {
       this.options.onToast?.('error', 'Microphone unavailable', describeMediaError(error));
     }
+  }
+
+  private honorMuteRequest(): void {
+    if (this.audioTrack?.enabled) this.audioTrack.enabled = false;
+    const micEnabled = this.audioTrack?.enabled === true;
+    this.replaceSnapshot({ micEnabled, mutedByHost: true });
+    this.broadcastState();
+    // Only now, after the local track is actually disabled, may the UI say the
+    // host muted this participant. Muting is otherwise advisory.
+    this.options.onToast?.(
+      'warning',
+      'Muted by host',
+      'Your microphone was turned off in this browser. You can unmute yourself at any time.',
+    );
   }
 
   private broadcastState(): void {
@@ -528,6 +643,17 @@ export class CallManager {
     } catch {
       // ignore
     }
+  }
+
+  private clearCallState(): void {
+    this.selfId = null;
+    this.snapshot = {
+      ...this.snapshot,
+      moderator: false,
+      spotlightId: null,
+      handRaised: false,
+      mutedByHost: false,
+    };
   }
 
   private closeAllPeers(): void {

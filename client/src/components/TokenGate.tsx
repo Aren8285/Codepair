@@ -86,7 +86,7 @@ export function TokenGate({ onConnect, error }: { onConnect: (token: string) => 
           </button>
         </form>
         <p className="gate__note">The token stays in this tab. Closing it, or stopping the host, revokes your access.</p>
-        <p className="gate__version">Local-first · v0.5.0</p>
+        <p className="gate__version">Local-first · v0.6.0</p>
       </section>
     </div>
   );

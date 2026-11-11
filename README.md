@@ -1,9 +1,9 @@
 # CodePair
 
 A hybrid **local-host collaborative IDE**. One machine (the **Host**) runs a small daemon
-that exposes a real project directory and a real terminal to a browser UI. Other people
-(**Remote Clients**) open a link, authenticate with a session token, and edit the Host's
-actual files, watch terminals run on the Host machine, and talk over WebRTC.
+that exposes one or more real project directories and a real terminal to a browser UI.
+Other people (**Remote Clients**) open a link, authenticate with a session token, and edit
+the Host's actual files, watch terminals run on the Host machine, and talk over WebRTC.
 
 Nothing is simulated: files are read and written on the Host's disk, the terminal is a
 `node-pty` shell process, collaboration is a real Yjs CRDT over authenticated WebSockets,
@@ -32,7 +32,11 @@ Host machine                                    Remote clients
   signalling relayed by the Host; media is only requested when you press the button.
   The panel minimizes to a pill or maximizes (capped at half the screen), an active
   screen share always gets a full-width featured tile, and every participant's video or
-  screen can be sent fullscreen from a button on the tile itself.
+  screen can be sent fullscreen from a button on the tile itself. The owner — or a
+  connection granted `call.moderate` — can ask a participant to mute, spotlight a tile,
+  or remove someone from the call without closing their editor. Everyone can raise a
+  hand. Mute is advisory: the target's own client disables its track, and "Muted by host"
+  appears only after that local track is off.
 - **Sandboxed paths** — every client-supplied path passes lexical *and* realpath
   containment checks; sensitive names (`.git`, `node_modules`, `.env*`, keys) are hidden.
 - **Path access rules** — per-session `hidden` / `r` / `rw` glob rules, enforced at one
@@ -41,6 +45,10 @@ Host machine                                    Remote clients
 - **Join approval (lobby)** — every guest token waits in a queue until the Host admits it
   as editor or viewer, denies it, or lets it expire; the Host can lock the room and kick a
   tab at any moment. `--no-lobby` restores the old "open the link and you are in" flow.
+- **Multiple rooms per daemon** — the default room keeps its original startup link; the
+  loopback Host API can create additional rooms at other canonical roots. Each room owns
+  its tokens, lobby, invites, root, documents, PTYs and signalling, and a room selector is
+  never a credential.
 - **Expiring invite links and live token rotation** — the Host console mints expiring,
   limited-use editor/viewer links; each redemption becomes a real token and still waits in
   the lobby. Rotating a role revokes that role's pending invites and stops its old token
@@ -115,7 +123,7 @@ Every token maps to exactly one role, and the role decides what that session may
 
 | Role | Capabilities | Can do |
 | --- | --- | --- |
-| `owner` | `fs.read`, `fs.write`, `fs.delete`, `term.use`, `call.join` | everything except administration |
+| `owner` | `fs.read`, `fs.write`, `fs.delete`, `term.use`, `call.join`, `call.moderate` | everything except administration |
 | `host` | `session.admin` | the Host console only; never a guest listener |
 | `editor` | `fs.read`, `fs.write`, `fs.delete`, `term.use`, `call.join` | edit, delete, terminal, calls |
 | `viewer` | `fs.read`, `call.join` | read files, receive live edits, join calls |
@@ -133,6 +141,9 @@ Every token maps to exactly one role, and the role decides what that session may
   writes are refused. A viewer token can never be admitted as an editor (`ROLE_CEILING`).
 - **The owner token never waits.** It bypasses the lobby and the lock, and its connection
   id can never be borrowed by a guest.
+- **Call moderation is scoped.** The owner holds `call.moderate`. The Host can grant it to
+  a live editor or viewer signal connection in one room; the grant is lost when that signal
+  socket closes and never becomes part of the role.
 
 ## Join lobby
 
@@ -159,7 +170,33 @@ the console:
 
 `--no-lobby` skips all of this: joins are admitted immediately, no connection id is
 required on any surface, and lobby actions answer `409 LOBBY_DISABLED`. The lobby is per
-session, so a root switch starts with an empty queue.
+room, so a root switch resets only that room's queue.
+
+## Rooms
+
+The daemon starts with one **default room** at `--root`, using the tokens supplied by the
+CLI. The loopback Host API can create more rooms at other canonical directories; there is
+no `--rooms` flag and no room-creation route on the guest listener. A room owns its session,
+root, token store, lobby, invites, document hub, PTYs and signalling hub.
+
+- **Fresh credentials.** A new room receives new owner/editor/viewer tokens, returned once
+  in the creation response. Existing tokens cannot be revealed again; rotate the role in
+  that room instead.
+- **Selector, not credential.** Guest HTTP requests may send
+  `X-CodePair-Room: <roomId>`; WebSockets and share links use `?room=<id>` and
+  `/room/<id>`. Omitting the selector targets the default room. The bearer token is always
+  checked against the selected room's token store, so a token from room A is `401` in
+  room B.
+- **No cross-room reuse.** A connection id is claimed by the first room it uses. Presenting
+  it to another room is `403 ROOM_MISMATCH` on HTTP and on the WebSocket upgrade.
+- **Room-local lifecycle.** Root switches, lobby queues, invites, document and terminal
+  sockets, and calls are scoped to one room. Two rooms cannot share a canonical root.
+  Deleting a room closes its document, terminal and signal sockets with `4412`, ends its
+  Host-console event stream and releases its claims. The default room cannot be deleted
+  (`409 DEFAULT_ROOM`).
+- **Moderation scope.** A moderation grant belongs to one live signal socket in one room.
+  It is lost when that socket closes, even when the same connection id reconnects. The
+  current Host console UI drives the default room; room orchestration is API-only.
 
 ## Path access policy
 
@@ -240,7 +277,7 @@ the admin token in that tab.
 
 | Route | Purpose |
 | --- | --- |
-| `GET /admin/api/state` | active session (`id`, `rootName`, `rootPath`, `createdAt`) and open handle counts |
+| `GET /admin/api/state` | active session (`id`, `roomId`, `rootName`, `rootPath`, `createdAt`) and open handle counts |
 | `GET /admin/api/fs/list?path=&showHidden=0\|1` | folder picker: directories only, realpath'd, hidden excluded by default, 500-entry cap |
 | `POST /admin/api/session/root` | `{ "path": "…", "confirmBroad": false }` → switches the project root |
 | `GET /admin/api/policy` | current `rules`, the built-in `defaults`, `confirmUnhide`, `terminalBypassesRules` |
@@ -256,7 +293,18 @@ the admin token in that tab.
 | `GET /admin/api/tokens` | which roles (`owner`, `editor`, `viewer`) have a token configured |
 | `POST /admin/api/tokens/:role/rotate` | returns a new token once; old token fails new requests, the role's live invites are revoked, existing sockets continue |
 | `GET /admin/api/tunnel` | `configured`, `provider`, `running`, `publicUrl`, `cloudflaredInstalled`, `installInstructions` |
-| `GET /admin/api/events?token=…` | SSE: an opening `snapshot` event, then `lobby` on every change, with a 15 s heartbeat |
+| `GET /admin/api/events?token=…` | default room SSE: an opening `snapshot` event, then `lobby` on every change, with a 15 s heartbeat |
+| `GET /admin/api/rooms` | rooms with root, creation time, default flag and admitted participant count |
+| `POST /admin/api/rooms` | `{ "path": "…", "confirmBroad": false }` → creates a room and returns its three tokens once |
+| `DELETE /admin/api/rooms/:roomId` | closes a non-default room and its sockets with `4412` |
+| `GET /admin/api/rooms/:roomId/events?token=…` | room-scoped SSE `snapshot` and `lobby` events |
+| `POST /admin/api/rooms/:roomId/moderators` | `{ "connectionId": "…" }` → grants `call.moderate` to a live signal connection |
+
+State, policy, lobby, kick, invite, token-rotation and root-switch routes also exist under
+`/admin/api/rooms/:roomId/…` for a specific room; moderator grants are room-scoped only.
+`GET /admin/api/fs/list` stays a daemon-level folder picker. The console UI currently drives
+the default room.
+
 
 ### Invite links and token rotation
 
@@ -269,7 +317,7 @@ tab even under React StrictMode.
 
 - A role with no configured token cannot mint an invite (`409 ROLE_NOT_CONFIGURED`); owner
   invites are refused.
-- At most 50 live invites exist per session (`429 INVITE_LIMIT`); TTL is at most seven
+- At most 50 live invites exist per room (`429 INVITE_LIMIT`); TTL is at most seven
   days and `maxUses` at most 1000.
 - Ten failed redeems against one id in a rolling 60 s window block that id for 60 s
   (`429 INVITE_RATE_LIMITED`). The failure tracker is capped at 256 ids; blocked entries
@@ -369,6 +417,14 @@ slides up as an overlay.
 6. **Prefer `read-only`** for demos and public tunnels, a VPN over a public tunnel, and
    HTTPS (the built-in tunnel provides it) so tokens and media never cross plaintext.
 
+**Room selection is not authentication.** `X-CodePair-Room` / `?room=` only chooses which
+room's token store checks the bearer token. A token from another room is `401`, and a
+connection id claimed by one room is rejected in another.
+
+**Call moderation is advisory for audio.** A host mute request asks the target's own client
+to disable its track; it is not a server-side remote mute. Removing someone from a call
+closes only their signal socket and does not revoke editing or terminal access.
+
 No CSRF tokens are needed: state-changing routes require a bearer token a cross-site
 page cannot read, and JSON bodies require a CORS preflight.
 
@@ -380,6 +436,11 @@ page cannot read, and JSON bodies require a CORS preflight.
   catching up). Both views settle as soon as both clients sync, and no content is
   duplicated or lost: two-client stress tests (same-region typing bursts, mid-typing
   disconnects, reconnects during the other's typing) all converge and persist correctly.
+- **Call moderation UI was not exercised by the browser harness** — the signalling
+  protocol is covered by server tests; the participant drawer is typechecked and builds,
+  but its visual interaction was not part of the 28-check run.
+- **Room browser coverage is server-side** — the 28-check browser run used the default
+  room; multi-room isolation is covered by the room integration tests.
 - **Camera/mic/screen share over LAN** — browsers require a *secure context*
   (HTTPS or `localhost`) for `getUserMedia` and `getDisplayMedia`. In development
   mode, Vite now serves HTTPS with a self-signed certificate automatically, so
@@ -416,11 +477,14 @@ CODE_PAIR_ICE_SERVERS='[
 
 ## Testing
 
-Currently 206 server tests (13 files) and 28 browser checks. The join lobby and Host
-console were also exercised with a temporary headless-Chrome flow (waiting room → admit →
-workspace → kick → removed screen → lock → locked screen), which is not committed. The
-committed browser run also covers invite creation, one-use redemption, lobby admission,
-`usedCount = 1`, and refusal to reuse the link.
+Currently 215 server tests (14 files) and 28 browser checks. The suite covers the original
+single-room behavior plus room creation, selector-vs-credential isolation, cross-room
+connection ids, room invites, scoped root switches, deletion teardown, and call moderation
+(grants, mute relay, spotlight, hand raise and call-only removal). The committed browser
+run covers file loading, concurrent edits, presence, remote cursors, terminal, 401 and
+traversal rejection, the share QR, mobile and landscape layout, one-use invite redemption,
+and root switching. Set `CODE_PAIR_ADMIN_TOKEN` to include the admin-driven invite and
+root-switch checks.
 
 ```bash
 npm run typecheck     # tsc for server + client
@@ -430,8 +494,8 @@ npm run build         # Vite client build + server tsc
 
 Browser-level checks live in `e2e/`:
 
-`browser.mjs` expects the daemon started with `--no-lobby`, because its flows assume guests
-are admitted immediately.
+`browser.mjs` drives the guest app against a running daemon; use an owner link or an
+admitted lobby session. Set `CODE_PAIR_ADMIN_TOKEN` for the root-switch and invite checks.
 
 ```bash
 cd e2e && npm install          # puppeteer-core

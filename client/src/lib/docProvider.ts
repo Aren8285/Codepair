@@ -26,6 +26,7 @@ export type DocMeta =
 
 interface ProviderOptions {
   token: string;
+  roomId: string;
   path: string;
   user: PresenceUser;
   onStatus: (state: ConnectionState) => void;
@@ -112,7 +113,7 @@ export class DocProvider {
   private connect(): void {
     if (this.destroyed) return;
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const url = `${protocol}//${window.location.host}/ws/doc?path=${encodeURIComponent(this.options.path)}&cid=${encodeURIComponent(currentConnectionId())}`;
+    const url = `${protocol}//${window.location.host}/ws/doc?path=${encodeURIComponent(this.options.path)}&cid=${encodeURIComponent(currentConnectionId())}&room=${encodeURIComponent(this.options.roomId)}`;
     this.setState(this.attempts === 0 ? 'connecting' : 'reconnecting');
 
     let socket: WebSocket;

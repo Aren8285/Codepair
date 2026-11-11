@@ -1,9 +1,9 @@
 # CodePair
 
 A hybrid **local-host collaborative IDE**. One machine (the **Host**) runs a small
-daemon that exposes a real project directory and a real terminal to a browser UI.
-Other people (**Remote Clients**) open a URL, authenticate with a session token,
-and edit the Host's actual files, watch terminals run on the Host machine, and
+daemon that exposes one or more real project directories and a real terminal to a
+browser UI. Other people (**Remote Clients**) open a URL, authenticate with a session
+token, and edit the Host's actual files, watch terminals run on the Host machine, and
 talk over WebRTC.
 
 Nothing is simulated: files are read and written on the Host's disk, the terminal
@@ -37,27 +37,28 @@ Host machine                                    Remote clients
 | `server/src/security/principal.ts` | Roles → capabilities; `host` is the only `session.admin` holder |
 | `server/src/files/fileService.ts` | Tree, read, search, create, rename, delete, ignored names |
 | `server/src/files/policyFileService.ts` | The single policy choke point: tree/search/read/mutate/`documentAccess`, `canonicalTarget` |
-| `server/src/session/session.ts` | One session: root, files, policy, hub, terminal, signalling, `access(principal)` |
-| `server/src/session/sessionManager.ts` | Current session, atomic root switch, disposal |
+| `server/src/session/session.ts` | One root: files, policy, document hub, terminal, lobby, invites, `access(principal)`; signalling lives on the room |
+| `server/src/session/sessionManager.ts` | Root-switch close codes/types and the single-session lifecycle reused by the registry |
+| `server/src/rooms/roomRegistry.ts` | Default + additional rooms, each with its own session, tokens, lobby and signalling; serialized create/switch/delete and unique canonical roots |
 | `server/src/lobby/lobby.ts` | Waiting room: queue, timeout, 50-pending cap, lock, kick, seat roles |
-| `server/src/lobby/connections.ts` | Daemon-level connection id → live sockets, so one kick reaches every surface |
+| `server/src/lobby/connections.ts` | Room-scoped connection-id claims and live sockets, so one kick/delete reaches every surface without cross-room leakage |
 | `server/src/lobby/principal.ts` | Seat ∩ token capability intersection |
 | `server/src/invites/invites.ts` | Per-session expiring/limited-use invites, fail-closed redeem, rate limiting, soft failure-tracker cap |
 | `server/src/tunnelStatus.ts` | Tunnel status snapshot and provider-CLI detection; no downloads or subprocesses |
-| `server/src/admin/adminApp.ts` | Loopback Host console: `/host` page, SSE, lobby/kick routes, state, folder list, root switch, policy, invites, token rotation, tunnel status |
+| `server/src/admin/adminApp.ts` | Loopback Host console: `/host` page, default + room-scoped routes, SSE, lobby/kick, state, folder list, root switch, policy, invites, token rotation, moderator grants, tunnel status |
 | `server/src/documents/documentHub.ts` | One Yjs doc per file, sync protocol, presence, debounced persistence |
 | `server/src/terminal/terminalService.ts` | PTY sessions, input/resize handling, shutdown |
 | `server/src/terminal/shellEnv.ts` | Minimal scrubbed environment + generated rc files |
-| `server/src/signaling/signalingHub.ts` | Room-scoped offer/answer/candidate relay |
+| `server/src/signaling/signalingHub.ts` | Room-scoped offer/answer/candidate relay plus live-socket moderator grants, mute requests, spotlight, hand raise and call-only removal |
 | `server/src/tunnel.ts` | `cloudflared` / `ngrok` child process, URL discovery, teardown |
 | `client/src/App.tsx` | Session lifecycle, layout, tabs, tree state, shortcuts |
 | `client/src/lib/docProvider.ts` | Authenticated Yjs provider (sync + awareness + save) |
 | `client/src/lib/connection.ts` | Per-tab connection id (`sessionStorage`) and rotation |
 | `client/src/components/LobbyScreen.tsx` | Waiting / denied / expired / removed / locked / full screens |
 | `client/src/host/*`, `client/host.html` | Host console UI: separate Vite entry, responsive page-level control room served only by the admin listener |
-| `client/src/lib/calls.ts` | Peer mesh, media state, screen share |
+| `client/src/lib/calls.ts` | Peer mesh, media state, screen share, moderation actions and "muted by host" handling |
 | `client/src/components/*` | IDE chrome: TopBar, FileTree, EditorPane, TerminalPanel, CallDock, dialogs |
-| `server/test/*` | 206 Vitest tests: sandboxing, policy, API, admin, capabilities, lobby, invites, doc sync, terminal, signalling |
+| `server/test/*` | 215 Vitest tests: sandboxing, policy, API, admin, capabilities, lobby, invites, rooms, doc sync, terminal, signalling |
 | `REPORT.md` | Final implementation report: verified features, tests, limitations, remaining work |
 | `e2e/browser.mjs` | Two-client headless-Chrome test of the real UI |
 
@@ -79,7 +80,7 @@ npm start -- --root ~/code/project --host 0.0.0.0
 ```
 
 The daemon prints a link containing the access token. Opening that link stores the
-token in `localStorage`; the URL fragment is cleared immediately and the token
+token in `sessionStorage`; the URL fragment is cleared immediately and the token
 never travels in query strings, Referer headers or access logs.
 
 ### CLI flags
@@ -123,6 +124,10 @@ Environment equivalents: `CODE_PAIR_MODE`, `CODE_PAIR_TOKEN`, `CODE_PAIR_PORT`, 
 * Origin checks run on every upgrade (`isOriginAllowed`): the request `Origin` host
   must match the `Host` header or an explicitly allowed origin. Non-browser clients
   may omit `Origin` and still need a valid token.
+* **Rooms and tokens.** Each room owns a `TokenStore`. `X-CodePair-Room` on HTTP and
+  `?room=` on WebSockets only select it; the bearer token is always validated against that
+  room. A missing selector means the default room, and a connection id claimed by one room
+  is `403 ROOM_MISMATCH` in another.
 * `read-only` mode is enforced on the server (`requireWrite`, terminal handshake
   rejection, read-only doc connections refuse Yjs updates) — not by hiding buttons.
 * **Roles vs. the admin listener.** Guest roles are `owner`, `editor` and `viewer`; since
@@ -145,7 +150,7 @@ Environment equivalents: `CODE_PAIR_MODE`, `CODE_PAIR_TOKEN`, `CODE_PAIR_PORT`, 
 
 ## Join lobby
 
-One `Lobby` per session (`server/src/lobby/lobby.ts`), reset by `switchRoot`.
+One `Lobby` per room (`server/src/lobby/lobby.ts`), reset by that room's `switchRoot`.
 
 * **Admission.** `POST /api/lobby/join` queues a connection id (client-generated per tab,
   16–64 chars) with a display name and the token's role. `GET /api/lobby/status` is the
@@ -168,7 +173,7 @@ One `Lobby` per session (`server/src/lobby/lobby.ts`), reset by `switchRoot`.
 
 ## Invites and token rotation
 
-`InviteStore` (`server/src/invites/invites.ts`) is per session, so a root switch starts
+`InviteStore` (`server/src/invites/invites.ts`) is per room, so a room root switch starts
 with no invites. An invite holds only `{ id, role, expiresAt, maxUses, usedCount }` — never
 a token value. The token is looked up when the link is redeemed, and the new token still
 has to pass the lobby.
@@ -271,8 +276,17 @@ optional decider. It can add refusals on top of `PathGuard`, never remove one.
 | `GET /admin/api/tokens` | configured roles |
 | `POST /admin/api/tokens/:role/rotate` | return a new token; invalidate the old one for new connections and revoke role invites |
 | `GET /admin/api/tunnel` | `configured`, `provider`, `running`, `publicUrl`, `cloudflaredInstalled`, `installInstructions` |
-| `GET /admin/api/events?token=` | SSE `snapshot` + `lobby` events, 15 s heartbeat |
+| `GET /admin/api/events?token=` | default-room SSE `snapshot` + `lobby` events, 15 s heartbeat |
+| `GET /admin/api/rooms` | rooms, roots, creation time, default flag, admitted count |
+| `POST /admin/api/rooms` | `{ path, confirmBroad? }` → create a room; returns its tokens once |
+| `DELETE /admin/api/rooms/:roomId` | close a non-default room; sockets close `4412` |
+| `GET /admin/api/rooms/:roomId/events?token=` | room-scoped SSE |
+| `POST /admin/api/rooms/:roomId/moderators` | grant `call.moderate` to a live signal connection |
 | `GET /host` | the console UI (admin listener only; 404 on the guest port) |
+
+State, policy, lobby, kick, invites, token rotation and root-switch routes also exist under
+`/admin/api/rooms/:roomId/…`; moderator grants are room-scoped only. Room
+creation/management is API-only; the console UI still drives the default room.
 
 Roots that are the filesystem root, the home directory (or its parents), `~/.ssh`,
 `~/.aws`, `~/.gnupg`, `~/.config` are refused; system directories need `confirmBroad`.
@@ -337,9 +351,14 @@ with only the project mounted, or keep the session read-only.
 
 ## WebRTC
 
-* `/ws/signal?room=<roomId>` accepts only the session's current room id; messages
-  are relayed only between sockets in that room, with SDP capped at 100 kB and
-  candidates at 4 kB, max 32 peers.
+* `/ws/signal?room=<roomId>` resolves one room and validates its token; each room has its
+  own `SignalingHub`. Messages are relayed only between sockets in that room, with SDP
+  capped at 100 kB and candidates at 4 kB, max 32 peers.
+* The owner can moderate; the Host can also grant `call.moderate` to a live editor/viewer
+  connection. The grant lives in the room's signal hub and is revoked when that socket
+  closes. Mute is a relayed request, not a server-side track change; spotlight and hand
+  raise broadcast to the room; remove-from-call closes only the signal socket with `4430`
+  and leaves the target's document and terminal connected.
 * `client/src/lib/calls.ts` maintains a full mesh: each peer gets one
   `RTCPeerConnection` with audio/video/screen tracks, and the "polite peer" rule
   (lower client id) resolves offer glare.
@@ -375,7 +394,7 @@ authenticated clients, which mirrors how any client that may call needs them.
 
 ```bash
 npm run typecheck     # tsc for server + client
-npm test              # Vitest: 206 tests — sandbox, policy, API, admin, lobby, invites, doc sync, terminal, signalling
+npm test              # Vitest: 215 tests — sandbox, policy, API, admin, lobby, invites, rooms, moderation, doc sync, terminal
 npm run build         # Vite client build + server tsc
 npm run dev           # tsx watch server + Vite client
 ```
@@ -384,14 +403,16 @@ Browser-level verification (two real Chrome clients, real keystrokes):
 
 ```bash
 cd e2e && npm install          # puppeteer-core
-node browser.mjs               # expects the daemon (started with --no-lobby) + Vite, see file header
+node browser.mjs               # running daemon + Chrome, see file header; set CODE_PAIR_ADMIN_TOKEN for admin checks
 ```
 
 It checks file loading from disk, typing that lands on the Host disk, presence,
 remote cursor labels, concurrent edits converging with nothing lost, a real shell
 running `node`, 401 for unauthenticated API calls, traversal rejection, the share
-dialog's QR, the mobile layout (no overflow, minimap off, drawer closed), and a
-one-use invite that redeems, is admitted, records exactly one use, and refuses reuse.
+dialog's QR, mobile and landscape layout, one-use invites, and — when
+`CODE_PAIR_ADMIN_TOKEN` is set — two root switches and the invite/admit flow. The
+28-check run uses the built guest app against one room; multi-room isolation is covered
+by server tests.
 
 ## Platform notes
 
@@ -421,3 +442,8 @@ one-use invite that redeems, is admitted, records exactly one use, and refuses r
    read-only sessions are the only way to close that gap.
 7. Hidden is not a permission: a hidden path is invisible (`404`/omitted/`4403`), and the
    default secret floor applies per session, resetting on every root switch.
+8. Room selection is not authentication: a token from room A is rejected in room B, and a
+   connection id claimed in one room cannot be replayed in another.
+9. Call moderation is advisory for audio. A mute request is fulfilled by the target's own
+   client; call removal closes only the signal socket and does not revoke file or terminal
+   access.

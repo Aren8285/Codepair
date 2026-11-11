@@ -6,6 +6,7 @@ export const CAPABILITIES = [
   'fs.delete',
   'term.use',
   'call.join',
+  'call.moderate',
   'session.admin',
 ] as const;
 
@@ -23,7 +24,7 @@ export interface Principal {
 export const ROLE_CAPABILITIES: Record<Role, readonly Capability[]> = {
   // The admin listener's grant is `host`; the owner token is a guest role and
   // never carries `session.admin`, so holding it grants nothing on that port.
-  owner: ['fs.read', 'fs.write', 'fs.delete', 'term.use', 'call.join'],
+  owner: ['fs.read', 'fs.write', 'fs.delete', 'term.use', 'call.join', 'call.moderate'],
   editor: ['fs.read', 'fs.write', 'fs.delete', 'term.use', 'call.join'],
   viewer: ['fs.read', 'call.join'],
   host: ['session.admin'],

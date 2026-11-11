@@ -10,12 +10,13 @@ type TerminalStatus = 'connecting' | 'ready' | 'exited' | 'offline';
 
 interface TerminalPanelProps {
   token: string;
+  roomId: string;
   rootName: string;
   onClose: () => void;
   onToast: (kind: 'success' | 'error' | 'info' | 'warning', message: string, detail?: string) => void;
 }
 
-export function TerminalPanel({ token, rootName, onClose, onToast }: TerminalPanelProps) {
+export function TerminalPanel({ token, roomId, rootName, onClose, onToast }: TerminalPanelProps) {
   const hostRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -84,7 +85,7 @@ export function TerminalPanel({ token, rootName, onClose, onToast }: TerminalPan
     let socket: WebSocket;
     try {
       socket = new WebSocket(
-        `${protocol}//${window.location.host}/ws/terminal?cid=${encodeURIComponent(currentConnectionId())}`,
+        `${protocol}//${window.location.host}/ws/terminal?cid=${encodeURIComponent(currentConnectionId())}&room=${encodeURIComponent(roomId)}`,
         ['codepair', token],
       );
     } catch {
@@ -172,7 +173,7 @@ export function TerminalPanel({ token, rootName, onClose, onToast }: TerminalPan
     };
     // The terminal is tied to the panel's lifetime.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [token]);
+  }, [token, roomId]);
 
   const label = status === 'ready' ? 'Connected' : status === 'connecting' ? 'Connecting' : status === 'exited' ? 'Exited' : 'Offline';
 

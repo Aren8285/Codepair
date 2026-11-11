@@ -4,11 +4,17 @@ import express, { type NextFunction, type Request, type Response } from 'express
 import { AppError, toErrorPayload, unauthorized } from '../errors.js';
 import type { ConnectionRegistry } from '../lobby/connections.js';
 import { DEFAULT_SECRET_RULES, rulesUnhideDefaults, validateRules } from '../security/accessPolicy.js';
-import { tokenFromAuthorizationHeader, type Authenticator, type TokenStore } from '../security/auth.js';
+import { tokenFromAuthorizationHeader, type Authenticator } from '../security/auth.js';
 import { requireCap } from '../security/gate.js';
 import { securityHeaders } from '../security/headers.js';
 import { listHostDirectories } from '../session/hostPaths.js';
-import type { SessionManager } from '../session/sessionManager.js';
+import type { Session } from '../session/session.js';
+import {
+  ROOM_CLOSE_CODE,
+  ROOM_CLOSE_REASON,
+  type Room,
+  type RoomRegistry,
+} from '../rooms/roomRegistry.js';
 import type { TunnelStatus } from '../tunnelStatus.js';
 
 /** Tags the admin authentication middleware (route audit). */
@@ -20,7 +26,7 @@ const FORWARDED_HEADERS = ['x-forwarded-for', 'x-forwarded-host', 'forwarded', '
 const ADMIN_JSON_LIMIT = '16kb';
 
 export interface AdminAppOptions {
-  sessions: SessionManager;
+  sessions: RoomRegistry;
   /**
    * Built from a single grant for the Host console. Guest grants are never
    * registered on this authenticator, and it is passed only to this app.
@@ -32,15 +38,14 @@ export interface AdminAppOptions {
   terminalBypassesRules: () => boolean;
   /** Daemon-level sockets, so one kick reaches every surface of a tab. */
   connections: ConnectionRegistry;
-  /** Host console stream: writes the opening snapshot, returns the unsubscribe. */
-  subscribeEvents: (response: Response) => () => void;
+  /** Host console stream for one room: writes the opening snapshot, returns the unsubscribe. */
+  subscribeEvents: (response: Response, roomId: string) => () => void;
+  /** End every host-console stream for a room that was just deleted. */
+  closeRoomEvents?: (roomId: string) => void;
   /** Built client directory; `host.html` is served only from this listener. */
   clientDist: string;
-  /** Guest token grants, for rotation and configured-role display. */
-  tokens: TokenStore;
   /** Live tunnel snapshot; read at request time. */
   tunnelStatus: () => TunnelStatus;
-  roomId: string;
   /** Guest-facing origin used when the console builds an invite link. */
   guestOrigin: () => string;
   logger?: Pick<Console, 'log' | 'error'>;
@@ -66,8 +71,16 @@ export function createAdminApp(options: AdminAppOptions): express.Express {
   });
   app.use(securityHeaders);
 
-  // EventSource cannot set headers, so this ONE admin route accepts `?token=`.
-  // It authenticates itself and then goes through the same capability gate;
+  const defaultRoom = (): Room => options.sessions.currentRoom();
+  const roomOrThrow = (roomId: string | undefined): Room => {
+    if (!roomId) throw new AppError(404, 'ROOM_NOT_FOUND', 'That room does not exist.');
+    const room = options.sessions.get(roomId);
+    if (!room) throw new AppError(404, 'ROOM_NOT_FOUND', 'That room does not exist.');
+    return room;
+  };
+
+  // EventSource cannot set headers, so these admin routes accept `?token=`.
+  // They authenticate themselves and then go through the same capability gate;
   // every other admin route still reads only Authorization, and the cross-route
   // test proves that is not a blanket query-token bypass.
   const queryTokenAuth = (request: Request, response: Response, next: NextFunction): void => {
@@ -82,14 +95,14 @@ export function createAdminApp(options: AdminAppOptions): express.Express {
     next();
   };
 
-  app.get('/admin/api/events', queryTokenAuth, requireCap('session.admin'), (request, response) => {
+  const streamEvents = (request: Request, response: Response, roomId: string): void => {
     response.status(200);
     response.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
     response.setHeader('Cache-Control', 'no-store');
     response.setHeader('Connection', 'keep-alive');
     response.setHeader('X-Accel-Buffering', 'no');
     response.flushHeaders();
-    const unsubscribe = options.subscribeEvents(response);
+    const unsubscribe = options.subscribeEvents(response, roomId);
     const heartbeat = setInterval(() => {
       try {
         response.write(': ping\n\n');
@@ -103,28 +116,29 @@ export function createAdminApp(options: AdminAppOptions): express.Express {
       unsubscribe();
       response.end();
     });
+  };
+
+  app.get('/admin/api/events', queryTokenAuth, requireCap('session.admin'), (request, response) => {
+    streamEvents(request, response, defaultRoom().id);
   });
+
+  app.get(
+    '/admin/api/rooms/:roomId/events',
+    queryTokenAuth,
+    requireCap('session.admin'),
+    (request, response) => {
+      const room = roomOrThrow(request.params.roomId);
+      streamEvents(request, response, room.id);
+    },
+  );
 
   const authenticate = taggedAuthenticator(options.authenticate);
   app.use('/admin', authenticate);
   app.use(express.json({ limit: ADMIN_JSON_LIMIT }));
 
   app.get('/admin/api/state', requireCap('session.admin'), (_request, response) => {
-    const session = options.sessions.current();
-    response.json({
-      session: {
-        id: session.id,
-        rootName: path.basename(session.root) || 'project',
-        rootPath: session.root,
-        createdAt: session.createdAt,
-        roomId: options.roomId,
-      },
-      openDocuments: session.documents.openDocuments,
-      documentConnections: session.documents.documentConnections,
-      terminals: session.terminals.activeSessions,
-      terminalBypassesRules: options.terminalBypassesRules(),
-      guestOrigin: options.guestOrigin(),
-    });
+    const room = defaultRoom();
+    response.json(roomStatePayload(room, options.terminalBypassesRules(), options.guestOrigin));
   });
 
   app.get(
@@ -138,81 +152,31 @@ export function createAdminApp(options: AdminAppOptions): express.Express {
   );
 
   app.get('/admin/api/policy', requireCap('session.admin'), (_request, response) => {
-    const session = options.sessions.current();
-    response.json({
-      rules: session.policy.rules,
-      defaults: DEFAULT_SECRET_RULES,
-      confirmUnhide: session.policy.confirmUnhide,
-      terminalBypassesRules: options.terminalBypassesRules(),
-    });
+    response.json(policyPayload(defaultRoom().session, options.terminalBypassesRules()));
   });
 
   app.put(
     '/admin/api/policy/rules',
     requireCap('session.admin'),
     asyncRoute(async (request, response) => {
-      const body = asRecord(request.body);
-      const unknown = Object.keys(body).filter((key) => key !== 'rules' && key !== 'confirmUnhide');
-      if (unknown.length > 0) {
-        throw new AppError(400, 'BAD_REQUEST', `Unknown field(s): ${unknown.join(', ')}.`);
-      }
-      if (body.rules === undefined) {
-        throw new AppError(400, 'BAD_REQUEST', '"rules" is required.');
-      }
-      if (body.confirmUnhide !== undefined && typeof body.confirmUnhide !== 'boolean') {
-        throw new AppError(400, 'BAD_REQUEST', '"confirmUnhide" must be a boolean.');
-      }
-      // Validate everything before touching the live list: a bad request must
-      // change nothing, and lifting a default needs an explicit confirmation.
-      const rules = validateRules(body.rules);
-      const confirmUnhide = body.confirmUnhide === true;
-      if (rulesUnhideDefaults(rules) && !confirmUnhide) {
-        throw new AppError(
-          400,
-          'UNHIDE_SECRET',
-          'Those rules expose a built-in secret default; pass confirmUnhide: true to allow it.',
-        );
-      }
-
-      const session = options.sessions.current();
-      const affected = await session.documents.applyPolicy(rules, confirmUnhide);
-      response.json({
-        rules: session.policy.rules,
-        confirmUnhide: session.policy.confirmUnhide,
-        affected,
-      });
+      response.json(await applyPolicyRules(defaultRoom().session, request.body));
     }),
   );
 
   app.get('/admin/api/lobby', requireCap('session.admin'), (_request, response) => {
-    response.json(options.sessions.current().lobby.snapshot());
+    response.json(defaultRoom().session.lobby.snapshot());
   });
 
   app.post('/admin/api/lobby/:id/admit', requireCap('session.admin'), (request, response) => {
-    const body = asRecord(request.body);
-    const role = body.role;
-    if (role !== 'editor' && role !== 'viewer') {
-      throw new AppError(400, 'BAD_REQUEST', '"role" must be "editor" or "viewer".');
-    }
-    const id = request.params.id;
-    if (!id) throw new AppError(400, 'BAD_REQUEST', 'A lobby entry id is required.');
-    response.json({ entry: options.sessions.current().lobby.admit(id, role) });
+    response.json({ entry: admitLobbyEntry(defaultRoom().session, request.params.id, request.body) });
   });
 
   app.post('/admin/api/lobby/:id/deny', requireCap('session.admin'), (request, response) => {
-    const id = request.params.id;
-    if (!id) throw new AppError(400, 'BAD_REQUEST', 'A lobby entry id is required.');
-    response.json({ entry: options.sessions.current().lobby.deny(id) });
+    response.json({ entry: denyLobbyEntry(defaultRoom().session, request.params.id) });
   });
 
   app.post('/admin/api/lobby/lock', requireCap('session.admin'), (request, response) => {
-    const body = asRecord(request.body);
-    if (typeof body.locked !== 'boolean') {
-      throw new AppError(400, 'BAD_REQUEST', '"locked" must be a boolean.');
-    }
-    const session = options.sessions.current();
-    session.lobby.setLocked(body.locked);
-    response.json(session.lobby.snapshot());
+    response.json(setLobbyLock(defaultRoom().session, request.body));
   });
 
   app.post(
@@ -221,71 +185,249 @@ export function createAdminApp(options: AdminAppOptions): express.Express {
     (request, response) => {
       const connectionId = request.params.connectionId;
       if (!connectionId) throw new AppError(400, 'BAD_REQUEST', 'A connection id is required.');
+      const room = defaultRoom();
       // Mark the connection removed first, so a reconnect is refused, then
       // close doc, terminal and signal sockets together.
-      options.sessions.current().lobby.kick(connectionId);
-      options.connections.close(connectionId);
+      room.session.lobby.kick(connectionId);
+      options.connections.close(room.id, connectionId);
       response.status(204).end();
     },
   );
 
   app.get('/admin/api/invites', requireCap('session.admin'), (_request, response) => {
-    response.json({ invites: options.sessions.current().invites.list() });
+    response.json({ invites: defaultRoom().session.invites.list() });
   });
 
   app.post('/admin/api/invites', requireCap('session.admin'), (request, response) => {
-    const body = asRecord(request.body);
-    const role = body.role;
-    if (role !== 'editor' && role !== 'viewer') {
-      throw new AppError(400, 'BAD_REQUEST', 'An invite can only grant editor or viewer access; owner is never allowed.');
-    }
-    const ttlMinutes = body.ttlMinutes;
-    if (ttlMinutes !== undefined && ttlMinutes !== null && typeof ttlMinutes !== 'number') {
-      throw new AppError(400, 'BAD_REQUEST', '"ttlMinutes" must be a number or null.');
-    }
-    const maxUses = body.maxUses;
-    if (maxUses !== undefined && maxUses !== null && typeof maxUses !== 'number') {
-      throw new AppError(400, 'BAD_REQUEST', '"maxUses" must be a number or null.');
-    }
-    response.status(201).json({
-      invite: options.sessions.current().invites.create({
-        role,
-        ttlMinutes: ttlMinutes ?? null,
-        maxUses: maxUses ?? null,
-      }),
-    });
+    response.status(201).json({ invite: createInvite(defaultRoom().session, request.body) });
   });
 
   app.post('/admin/api/invites/:id/revoke', requireCap('session.admin'), (request, response) => {
-    const id = request.params.id;
-    if (!id) throw new AppError(400, 'BAD_REQUEST', 'An invite id is required.');
-    response.json({ invite: options.sessions.current().invites.revoke(id) });
+    response.json({ invite: revokeInvite(defaultRoom().session, request.params.id) });
   });
 
   app.get('/admin/api/tokens', requireCap('session.admin'), (_request, response) => {
-    const roles = ['owner', 'editor', 'viewer'] as const;
-    response.json({
-      roles: roles.map((role) => ({ role, configured: options.tokens.tokenFor(role) !== undefined })),
-    });
+    response.json({ roles: tokenRoles(defaultRoom()) });
   });
 
   app.post('/admin/api/tokens/:role/rotate', requireCap('session.admin'), (request, response) => {
-    const role = request.params.role;
-    if (role !== 'owner' && role !== 'editor' && role !== 'viewer') {
-      throw new AppError(400, 'BAD_REQUEST', '"role" must be owner, editor or viewer.');
-    }
-    const token = options.tokens.rotate(role);
-    if (!token) {
-      throw new AppError(404, 'TOKEN_NOT_CONFIGURED', `No ${role} token is configured on this host.`);
-    }
-    // A rotated role's invites are destroyed, not transferred to the new token.
-    if (role !== 'owner') options.sessions.current().invites.revokeForRole(role);
-    response.json({ role, token });
+    response.json(rotateToken(defaultRoom(), request.params.role));
   });
 
   app.get('/admin/api/tunnel', requireCap('session.admin'), (_request, response) => {
     response.json(options.tunnelStatus());
   });
+
+  // ---- Room-scoped admin routes ------------------------------------------------
+
+  app.get('/admin/api/rooms', requireCap('session.admin'), (_request, response) => {
+    response.json({
+      rooms: options.sessions.list().map((room) => ({
+        id: room.id,
+        rootName: path.basename(room.session.root) || 'project',
+        rootPath: room.session.root,
+        createdAt: room.createdAt,
+        isDefault: room.isDefault,
+        participants: room.session.lobby.snapshot().admitted.length,
+      })),
+    });
+  });
+
+  app.post(
+    '/admin/api/rooms',
+    requireCap('session.admin'),
+    asyncRoute(async (request, response) => {
+      const body = asRecord(request.body);
+      const root = body.path;
+      if (typeof root !== 'string' || root.length === 0) {
+        throw new AppError(400, 'BAD_REQUEST', '"path" must be a non-empty string.');
+      }
+      if (body.confirmBroad !== undefined && typeof body.confirmBroad !== 'boolean') {
+        throw new AppError(400, 'BAD_REQUEST', '"confirmBroad" must be a boolean.');
+      }
+      const room = await options.sessions.create({ root, confirmBroad: body.confirmBroad === true });
+      (options.logger ?? console).log(`[codepair] host console: created room ${room.id} at ${room.session.root}`);
+      response.status(201).json({
+        room: {
+          id: room.id,
+          rootName: path.basename(room.session.root) || 'project',
+          rootPath: room.session.root,
+          createdAt: room.createdAt,
+          isDefault: room.isDefault,
+        },
+        tokens: {
+          owner: room.tokens.tokenFor('owner'),
+          editor: room.tokens.tokenFor('editor'),
+          viewer: room.tokens.tokenFor('viewer'),
+        },
+      });
+    }),
+  );
+
+  app.delete(
+    '/admin/api/rooms/:roomId',
+    requireCap('session.admin'),
+    asyncRoute(async (request, response) => {
+      const room = roomOrThrow(request.params.roomId);
+      await options.sessions.dispose(room.id);
+      options.connections.closeRoom(room.id, ROOM_CLOSE_CODE, ROOM_CLOSE_REASON);
+      options.closeRoomEvents?.(room.id);
+      (options.logger ?? console).log(`[codepair] host console: closed room ${room.id}`);
+      response.status(204).end();
+    }),
+  );
+
+  app.get('/admin/api/rooms/:roomId/state', requireCap('session.admin'), (request, response) => {
+    const room = roomOrThrow(request.params.roomId);
+    response.json(roomStatePayload(room, options.terminalBypassesRules(), options.guestOrigin));
+  });
+
+  app.get('/admin/api/rooms/:roomId/policy', requireCap('session.admin'), (request, response) => {
+    const room = roomOrThrow(request.params.roomId);
+    response.json(policyPayload(room.session, options.terminalBypassesRules()));
+  });
+
+  app.put(
+    '/admin/api/rooms/:roomId/policy/rules',
+    requireCap('session.admin'),
+    asyncRoute(async (request, response) => {
+      const room = roomOrThrow(request.params.roomId);
+      response.json(await applyPolicyRules(room.session, request.body));
+    }),
+  );
+
+  app.get('/admin/api/rooms/:roomId/lobby', requireCap('session.admin'), (request, response) => {
+    response.json(roomOrThrow(request.params.roomId).session.lobby.snapshot());
+  });
+
+  app.post(
+    '/admin/api/rooms/:roomId/lobby/:id/admit',
+    requireCap('session.admin'),
+    (request, response) => {
+      const room = roomOrThrow(request.params.roomId);
+      response.json({ entry: admitLobbyEntry(room.session, request.params.id, request.body) });
+    },
+  );
+
+  app.post(
+    '/admin/api/rooms/:roomId/lobby/:id/deny',
+    requireCap('session.admin'),
+    (request, response) => {
+      const room = roomOrThrow(request.params.roomId);
+      response.json({ entry: denyLobbyEntry(room.session, request.params.id) });
+    },
+  );
+
+  app.post(
+    '/admin/api/rooms/:roomId/lobby/lock',
+    requireCap('session.admin'),
+    (request, response) => {
+      const room = roomOrThrow(request.params.roomId);
+      response.json(setLobbyLock(room.session, request.body));
+    },
+  );
+
+  app.post(
+    '/admin/api/rooms/:roomId/connections/:connectionId/kick',
+    requireCap('session.admin'),
+    (request, response) => {
+      const room = roomOrThrow(request.params.roomId);
+      const connectionId = request.params.connectionId;
+      if (!connectionId) throw new AppError(400, 'BAD_REQUEST', 'A connection id is required.');
+      room.session.lobby.kick(connectionId);
+      options.connections.close(room.id, connectionId);
+      response.status(204).end();
+    },
+  );
+
+  app.get('/admin/api/rooms/:roomId/invites', requireCap('session.admin'), (request, response) => {
+    response.json({ invites: roomOrThrow(request.params.roomId).session.invites.list() });
+  });
+
+  app.post('/admin/api/rooms/:roomId/invites', requireCap('session.admin'), (request, response) => {
+    const room = roomOrThrow(request.params.roomId);
+    response.status(201).json({ invite: createInvite(room.session, request.body) });
+  });
+
+  app.post(
+    '/admin/api/rooms/:roomId/invites/:id/revoke',
+    requireCap('session.admin'),
+    (request, response) => {
+      const room = roomOrThrow(request.params.roomId);
+      response.json({ invite: revokeInvite(room.session, request.params.id) });
+    },
+  );
+
+  app.get('/admin/api/rooms/:roomId/tokens', requireCap('session.admin'), (request, response) => {
+    response.json({ roles: tokenRoles(roomOrThrow(request.params.roomId)) });
+  });
+
+  app.post(
+    '/admin/api/rooms/:roomId/tokens/:role/rotate',
+    requireCap('session.admin'),
+    (request, response) => {
+      const room = roomOrThrow(request.params.roomId);
+      response.json(rotateToken(room, request.params.role));
+    },
+  );
+
+  app.post(
+    '/admin/api/rooms/:roomId/session/root',
+    requireCap('session.admin'),
+    asyncRoute(async (request, response) => {
+      const room = roomOrThrow(request.params.roomId);
+      const body = asRecord(request.body);
+      const target = body.path;
+      if (typeof target !== 'string' || target.length === 0) {
+        throw new AppError(400, 'BAD_REQUEST', '"path" must be a non-empty string.');
+      }
+      if (body.confirmBroad !== undefined && typeof body.confirmBroad !== 'boolean') {
+        throw new AppError(400, 'BAD_REQUEST', '"confirmBroad" must be a boolean.');
+      }
+      const result = await options.sessions.switchRoot(room.id, target, {
+        confirmBroad: body.confirmBroad === true,
+      });
+      const logger = options.logger ?? console;
+      logger.log(
+        `[codepair] host console: room ${room.id} ${
+          result.changed ? 'project root switched to' : 'project root unchanged:'
+        } ${result.session.root}`,
+      );
+      if (result.flushErrors.length > 0) {
+        logger.error(`[codepair] host console: could not save ${result.flushErrors.join(', ')} before switching.`);
+      }
+      response.json({
+        changed: result.changed,
+        session: {
+          id: result.session.id,
+          rootName: path.basename(result.session.root) || 'project',
+          rootPath: result.session.root,
+          createdAt: result.session.createdAt,
+          roomId: room.id,
+        },
+        flushErrors: result.flushErrors,
+      });
+    }),
+  );
+
+  app.post(
+    '/admin/api/rooms/:roomId/moderators',
+    requireCap('session.admin'),
+    (request, response) => {
+      const room = roomOrThrow(request.params.roomId);
+      const body = asRecord(request.body);
+      const connectionId = body.connectionId;
+      if (typeof connectionId !== 'string' || connectionId.length === 0) {
+        throw new AppError(400, 'BAD_REQUEST', '"connectionId" must be a non-empty string.');
+      }
+      if (!room.signaling.hasConnection(connectionId)) {
+        throw new AppError(409, 'NOT_IN_CALL', 'That connection is not in this room’s call.');
+      }
+      room.moderators.add(connectionId);
+      room.signaling.grantModerator(connectionId);
+      response.json({ connectionId, moderator: true });
+    },
+  );
 
   app.post(
     '/admin/api/session/root',
@@ -316,6 +458,7 @@ export function createAdminApp(options: AdminAppOptions): express.Express {
           rootName: path.basename(result.session.root) || 'project',
           rootPath: result.session.root,
           createdAt: result.session.createdAt,
+          roomId: defaultRoom().id,
         },
         flushErrors: result.flushErrors,
       });
@@ -365,6 +508,131 @@ export function createAdminApp(options: AdminAppOptions): express.Express {
   });
 
   return app;
+}
+
+function roomStatePayload(room: Room, terminalBypassesRules: boolean, guestOrigin: () => string) {
+  return {
+    session: {
+      id: room.session.id,
+      rootName: path.basename(room.session.root) || 'project',
+      rootPath: room.session.root,
+      createdAt: room.session.createdAt,
+      roomId: room.id,
+    },
+    openDocuments: room.session.documents.openDocuments,
+    documentConnections: room.session.documents.documentConnections,
+    terminals: room.session.terminals.activeSessions,
+    terminalBypassesRules,
+    guestOrigin: guestOrigin(),
+  };
+}
+
+function policyPayload(session: Session, terminalBypassesRules: boolean) {
+  return {
+    rules: session.policy.rules,
+    defaults: DEFAULT_SECRET_RULES,
+    confirmUnhide: session.policy.confirmUnhide,
+    terminalBypassesRules,
+  };
+}
+
+async function applyPolicyRules(session: Session, rawBody: unknown) {
+  const body = asRecord(rawBody);
+  const unknown = Object.keys(body).filter((key) => key !== 'rules' && key !== 'confirmUnhide');
+  if (unknown.length > 0) {
+    throw new AppError(400, 'BAD_REQUEST', `Unknown field(s): ${unknown.join(', ')}.`);
+  }
+  if (body.rules === undefined) {
+    throw new AppError(400, 'BAD_REQUEST', '"rules" is required.');
+  }
+  if (body.confirmUnhide !== undefined && typeof body.confirmUnhide !== 'boolean') {
+    throw new AppError(400, 'BAD_REQUEST', '"confirmUnhide" must be a boolean.');
+  }
+  // Validate everything before touching the live list: a bad request must
+  // change nothing, and lifting a default needs an explicit confirmation.
+  const rules = validateRules(body.rules);
+  const confirmUnhide = body.confirmUnhide === true;
+  if (rulesUnhideDefaults(rules) && !confirmUnhide) {
+    throw new AppError(
+      400,
+      'UNHIDE_SECRET',
+      'Those rules expose a built-in secret default; pass confirmUnhide: true to allow it.',
+    );
+  }
+  const affected = await session.documents.applyPolicy(rules, confirmUnhide);
+  return {
+    rules: session.policy.rules,
+    confirmUnhide: session.policy.confirmUnhide,
+    affected,
+  };
+}
+
+function admitLobbyEntry(session: Session, id: string | undefined, rawBody: unknown) {
+  const body = asRecord(rawBody);
+  const role = body.role;
+  if (role !== 'editor' && role !== 'viewer') {
+    throw new AppError(400, 'BAD_REQUEST', '"role" must be "editor" or "viewer".');
+  }
+  if (!id) throw new AppError(400, 'BAD_REQUEST', 'A lobby entry id is required.');
+  return session.lobby.admit(id, role);
+}
+
+function denyLobbyEntry(session: Session, id: string | undefined) {
+  if (!id) throw new AppError(400, 'BAD_REQUEST', 'A lobby entry id is required.');
+  return session.lobby.deny(id);
+}
+
+function setLobbyLock(session: Session, rawBody: unknown) {
+  const body = asRecord(rawBody);
+  if (typeof body.locked !== 'boolean') {
+    throw new AppError(400, 'BAD_REQUEST', '"locked" must be a boolean.');
+  }
+  session.lobby.setLocked(body.locked);
+  return session.lobby.snapshot();
+}
+
+function createInvite(session: Session, rawBody: unknown) {
+  const body = asRecord(rawBody);
+  const role = body.role;
+  if (role !== 'editor' && role !== 'viewer') {
+    throw new AppError(400, 'BAD_REQUEST', 'An invite can only grant editor or viewer access; owner is never allowed.');
+  }
+  const ttlMinutes = body.ttlMinutes;
+  if (ttlMinutes !== undefined && ttlMinutes !== null && typeof ttlMinutes !== 'number') {
+    throw new AppError(400, 'BAD_REQUEST', '"ttlMinutes" must be a number or null.');
+  }
+  const maxUses = body.maxUses;
+  if (maxUses !== undefined && maxUses !== null && typeof maxUses !== 'number') {
+    throw new AppError(400, 'BAD_REQUEST', '"maxUses" must be a number or null.');
+  }
+  return session.invites.create({
+    role,
+    ttlMinutes: ttlMinutes ?? null,
+    maxUses: maxUses ?? null,
+  });
+}
+
+function revokeInvite(session: Session, id: string | undefined) {
+  if (!id) throw new AppError(400, 'BAD_REQUEST', 'An invite id is required.');
+  return session.invites.revoke(id);
+}
+
+function tokenRoles(room: Room) {
+  const roles = ['owner', 'editor', 'viewer'] as const;
+  return roles.map((role) => ({ role, configured: room.tokens.tokenFor(role) !== undefined }));
+}
+
+function rotateToken(room: Room, role: string | undefined) {
+  if (role !== 'owner' && role !== 'editor' && role !== 'viewer') {
+    throw new AppError(400, 'BAD_REQUEST', '"role" must be owner, editor or viewer.');
+  }
+  const token = room.tokens.rotate(role);
+  if (!token) {
+    throw new AppError(404, 'TOKEN_NOT_CONFIGURED', `No ${role} token is configured on this host.`);
+  }
+  // A rotated role's invites are destroyed, not transferred to the new token.
+  if (role !== 'owner') room.session.invites.revokeForRole(role);
+  return { role, token };
 }
 
 function loopbackOnly(port: () => number) {

@@ -310,11 +310,19 @@ describe('admin listener', () => {
       }));
 
     expect(routes.map((route) => `${route.methods.join(',')} ${route.path}`).sort()).toEqual([
+      'DELETE /admin/api/rooms/:roomId',
       'GET /admin/api/events',
       'GET /admin/api/fs/list',
       'GET /admin/api/invites',
       'GET /admin/api/lobby',
       'GET /admin/api/policy',
+      'GET /admin/api/rooms',
+      'GET /admin/api/rooms/:roomId/events',
+      'GET /admin/api/rooms/:roomId/invites',
+      'GET /admin/api/rooms/:roomId/lobby',
+      'GET /admin/api/rooms/:roomId/policy',
+      'GET /admin/api/rooms/:roomId/state',
+      'GET /admin/api/rooms/:roomId/tokens',
       'GET /admin/api/state',
       'GET /admin/api/tokens',
       'GET /admin/api/tunnel',
@@ -324,9 +332,20 @@ describe('admin listener', () => {
       'POST /admin/api/lobby/:id/admit',
       'POST /admin/api/lobby/:id/deny',
       'POST /admin/api/lobby/lock',
+      'POST /admin/api/rooms',
+      'POST /admin/api/rooms/:roomId/connections/:connectionId/kick',
+      'POST /admin/api/rooms/:roomId/invites',
+      'POST /admin/api/rooms/:roomId/invites/:id/revoke',
+      'POST /admin/api/rooms/:roomId/lobby/:id/admit',
+      'POST /admin/api/rooms/:roomId/lobby/:id/deny',
+      'POST /admin/api/rooms/:roomId/lobby/lock',
+      'POST /admin/api/rooms/:roomId/moderators',
+      'POST /admin/api/rooms/:roomId/session/root',
+      'POST /admin/api/rooms/:roomId/tokens/:role/rotate',
       'POST /admin/api/session/root',
       'POST /admin/api/tokens/:role/rotate',
       'PUT /admin/api/policy/rules',
+      'PUT /admin/api/rooms/:roomId/policy/rules',
     ]);
 
     for (const route of routes) {

@@ -4,9 +4,19 @@ import { startTestServer, waitFor, type TestServer } from './helpers/testServer.
 
 let current: TestServer | undefined;
 const peers: SignalPeer[] = [];
+const extraSockets: WebSocket[] = [];
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 afterEach(async () => {
   for (const peer of peers.splice(0)) peer.close();
+  for (const socket of extraSockets.splice(0)) {
+    try {
+      socket.terminate();
+    } catch {
+      // already closed
+    }
+  }
   await current?.cleanup();
   current = undefined;
 });
@@ -45,10 +55,16 @@ class SignalPeer {
     socket.on('error', () => undefined);
   }
 
-  static async connect(ctx: TestServer, room = ctx.config.roomId): Promise<SignalPeer> {
+  static async connect(
+    ctx: TestServer,
+    room = ctx.config.roomId,
+    options: { token?: string; cid?: string } = {},
+  ): Promise<SignalPeer> {
+    const params = new URLSearchParams({ room });
+    if (options.cid) params.set('cid', options.cid);
     const socket = new WebSocket(
-      `${ctx.base.replace('http://', 'ws://')}/ws/signal?room=${encodeURIComponent(room)}`,
-      ['codepair', ctx.token],
+      `${ctx.base.replace('http://', 'ws://')}/ws/signal?${params.toString()}`,
+      ['codepair', options.token ?? ctx.token],
     );
     await new Promise<void>((resolve, reject) => {
       socket.once('open', () => resolve());
@@ -100,6 +116,38 @@ async function connectAndJoin(
     self: { id: string; name: string; color: string };
   };
   return { peer, self: joined.self };
+}
+
+async function connectAs(
+  ctx: TestServer,
+  options: { token: string; cid: string; room?: string; name?: string },
+): Promise<{ peer: SignalPeer; self: { id: string; name: string; color: string } }> {
+  const peer = await SignalPeer.connect(ctx, options.room ?? ctx.config.roomId, {
+    token: options.token,
+    cid: options.cid,
+  });
+  peer.send({
+    type: 'join',
+    name: options.name ?? 'Tester',
+    color: '#3366ff',
+    mic: true,
+    cam: false,
+    screen: false,
+  });
+  const joined = (await peer.next((message) => message.type === 'joined')) as {
+    self: { id: string; name: string; color: string };
+  };
+  return { peer, self: joined.self };
+}
+
+async function openAuxSocket(ctx: TestServer, route: string, token: string): Promise<WebSocket> {
+  const socket = new WebSocket(`${ctx.wsBase}${route}`, ['codepair', token]);
+  extraSockets.push(socket);
+  await new Promise<void>((resolve, reject) => {
+    socket.once('open', () => resolve());
+    socket.once('error', reject);
+  });
+  return socket;
 }
 
 describe('WebRTC signalling', () => {
@@ -202,5 +250,121 @@ describe('WebRTC signalling', () => {
     binary.peer.socket.send(Buffer.from([0, 1, 2]));
     await waitFor(() => binary.peer.closedCode !== undefined, 3000, 'binary close');
     expect(binary.peer.closedCode).toBe(4401);
+  });
+});
+
+describe('call moderation', () => {
+  const EDITOR = 'editor-token-0123456789ab';
+  const VIEWER = 'viewer-token-0123456789ab';
+
+  it('grant is live-socket scoped: a brief drop revokes it even with the same connection id', async () => {
+    current = await startTestServer({
+      files: { 'a.txt': 'x\n' },
+      tokens: { editor: EDITOR, viewer: VIEWER },
+    });
+    const owner = await connectAs(current, { token: current.tokens.owner, cid: 'mod-owner-0123456789' });
+    const editor = await connectAs(current, { token: EDITOR, cid: 'mod-editor-0123456789' });
+    const viewer = await connectAs(current, { token: VIEWER, cid: 'mod-viewer-0123456789' });
+
+    editor.peer.send({ type: 'mute-request', to: viewer.self.id });
+    const forbidden = await editor.peer.next((message) => message.type === 'error');
+    expect(forbidden.code).toBe('FORBIDDEN');
+    expect(forbidden.status).toBe(403);
+    await sleep(100);
+    expect(viewer.peer.seen((message) => message.type === 'mute-request')).toBe(false);
+
+    const granted = await current.requestAdmin(
+      `/admin/api/rooms/${encodeURIComponent(current.config.roomId)}/moderators`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ connectionId: 'mod-editor-0123456789' }),
+      },
+    );
+    expect(granted.status).toBe(200);
+
+    editor.peer.send({ type: 'mute-request', to: viewer.self.id });
+    const relay = await viewer.peer.next((message) => message.type === 'mute-request');
+    expect(relay.from).toBe(editor.self.id);
+    await sleep(100);
+    expect(
+      owner.peer.seen((message) => message.type === 'peer-state' && message.id === viewer.self.id && message.mic === false),
+      'a mute request must not claim the target is actually muted',
+    ).toBe(false);
+
+    editor.peer.close();
+    await waitFor(() => editor.peer.closedCode !== undefined, 3000, 'the moderator signal socket to close');
+
+    const reconnected = await connectAs(current, { token: EDITOR, cid: 'mod-editor-0123456789' });
+    reconnected.peer.send({ type: 'mute-request', to: viewer.self.id });
+    const deniedAfterReconnect = await reconnected.peer.next((message) => message.type === 'error');
+    expect(deniedAfterReconnect.code).toBe('FORBIDDEN');
+    expect(deniedAfterReconnect.status).toBe(403);
+  });
+
+  it('relays spotlight and hand-raise to the whole room but only moderators may spotlight', async () => {
+    current = await startTestServer({
+      files: { 'a.txt': 'x\n' },
+      tokens: { editor: EDITOR, viewer: VIEWER },
+    });
+    const owner = await connectAs(current, { token: current.tokens.owner, cid: 'spot-owner-0123456789' });
+    const editor = await connectAs(current, { token: EDITOR, cid: 'spot-editor-0123456789' });
+    const viewer = await connectAs(current, { token: VIEWER, cid: 'spot-viewer-0123456789' });
+
+    owner.peer.send({ type: 'spotlight', to: viewer.self.id });
+    for (const participant of [owner, editor, viewer]) {
+      const message = await participant.peer.next((candidate) => candidate.type === 'spotlight', 1000);
+      expect(message.peerId).toBe(viewer.self.id);
+      expect(message.from).toBe(owner.self.id);
+    }
+
+    owner.peer.send({ type: 'spotlight', to: null });
+    for (const participant of [owner, editor, viewer]) {
+      const message = await participant.peer.next((candidate) => candidate.type === 'spotlight', 1000);
+      expect(message.peerId).toBeNull();
+    }
+
+    editor.peer.send({ type: 'hand-raise', raised: true });
+    for (const participant of [owner, editor, viewer]) {
+      const message = await participant.peer.next((candidate) => candidate.type === 'hand-raise', 1000);
+      expect(message.from).toBe(editor.self.id);
+      expect(message.raised).toBe(true);
+    }
+
+    editor.peer.send({ type: 'spotlight', to: viewer.self.id });
+    const denied = await editor.peer.next((message) => message.type === 'error');
+    expect(denied.code).toBe('FORBIDDEN');
+    expect(denied.status).toBe(403);
+  });
+
+  it('kick-from-call closes only the target signalling socket and allows an immediate rejoin', async () => {
+    current = await startTestServer({
+      files: { 'a.txt': 'x\n' },
+      tokens: { editor: EDITOR, viewer: VIEWER },
+      env: { CODE_PAIR_TERMINAL: 'on' },
+    });
+    const cid = 'call-kick-0123456789';
+    const owner = await connectAs(current, { token: current.tokens.owner, cid: 'call-owner-0123456789' });
+    const viewer = await connectAs(current, { token: VIEWER, cid });
+
+    const doc = await openAuxSocket(
+      current,
+      `/ws/doc?path=a.txt&cid=${cid}&room=${encodeURIComponent(current.config.roomId)}`,
+      EDITOR,
+    );
+    const terminal = await openAuxSocket(
+      current,
+      `/ws/terminal?cid=${cid}&room=${encodeURIComponent(current.config.roomId)}`,
+      EDITOR,
+    );
+
+    owner.peer.send({ type: 'kick-from-call', to: viewer.self.id });
+    await waitFor(() => viewer.peer.closedCode !== undefined, 3000, 'the target signal socket to close');
+    expect(viewer.peer.closedCode).toBe(4430);
+    expect(doc.readyState, 'the document socket is not part of the call').toBe(WebSocket.OPEN);
+    expect(terminal.readyState, 'the terminal socket is not part of the call').toBe(WebSocket.OPEN);
+
+    const rejoined = await connectAs(current, { token: VIEWER, cid });
+    expect(rejoined.self.id).toBeTruthy();
   });
 });

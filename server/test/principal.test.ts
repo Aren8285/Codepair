@@ -21,7 +21,7 @@ describe('principals', () => {
     // The Host principal is the only one that administers the session; the
     // owner token is a guest role and must never carry `session.admin`.
     expect([...ROLE_CAPABILITIES.owner].sort()).toEqual(
-      ['fs.read', 'fs.write', 'fs.delete', 'term.use', 'call.join'].sort(),
+      ['fs.read', 'fs.write', 'fs.delete', 'term.use', 'call.join', 'call.moderate'].sort(),
     );
     expect([...ROLE_CAPABILITIES.editor].sort()).toEqual(
       ['fs.read', 'fs.write', 'fs.delete', 'term.use', 'call.join'].sort(),
