@@ -1,6 +1,6 @@
 # CodePair — Implementation Report
 
-Version 0.7.0 · macOS arm64 · Node v22.21.1 · npm 10.9.4
+Version 0.7.0 · macOS arm64 · Node v22.21.1 · npm 10.9.4 · release commit `4e40f7d`
 
 Base report written at 0.2.0; §1 and §3 are kept current, and the addendum at the end
 records each iteration (0.3.x: host console API, host principal, path policy; 0.4.0: join
@@ -85,7 +85,7 @@ Full detail lives in [AGENT.md](AGENT.md).
 
 ## 3. Tests executed
 
-### Server suite — 215 tests, all passing
+### Server suite — 226 tests, all passing
 
 ```
 ✓ test/admin.test.ts       (26)  loopback guards, token separation, root switch, route audit, rotation, tunnel
@@ -101,7 +101,9 @@ Full detail lives in [AGENT.md](AGENT.md).
 ✓ test/twoLaptop.test.ts   ( 2)  same-region typing bursts, reconnect convergence
 ✓ test/lobby.test.ts       (19)  queue, timeout, cap, lock, kick, seat ceiling, SSE, flags
 ✓ test/invites.test.ts     (15)  TTL, use caps, fail-closed errors, rate limit, tracker cap/soft cap
-✓ test/rooms.test.ts       ( 6)  creation, token isolation, selector-only auth, cross-room ids, room invites, scoped switch/delete
+✓ test/rooms.test.ts      ( 6)  creation, token isolation, selector-only auth, cross-room ids, room invites, scoped switch/delete
+✓ test/interview.test.ts  ( 9)  candidate caps/policy, consent gate, bounded events, role ceiling, replay, symlink escape
+✓ test/interviewTerminal.test.ts (2) exact Docker flags/mounts, fail-closed 4403, zero host spawns, no fallback
 ```
 
 Notable security assertions:
@@ -507,9 +509,13 @@ token can be rotated live; TURN credentials never reach the client UI.
 
 ### 8.2 Sandboxed / safeguarded terminal
 
-**Current state:** terminal is a real `node-pty` shell as the host user with a
-scrubbed env and generated rc files. Deliberately *not* a security boundary —
-anyone with the token can do anything the host user can (§5 "Security posture").
+**Current state (0.7.0):** the ordinary editor/owner terminal is a real `node-pty` shell
+as the host user with a scrubbed env and generated rc files. It is deliberately *not* a
+security boundary — anyone with the token can do anything the host user can (§5 "Security
+posture"). The interview candidate terminal is the separate exception: a Docker-only
+container with no network, dropped capabilities, a non-root user, resource caps, the
+project root `:ro` and only the candidate folder `:rw`; if Docker or the image is missing
+it closes with `4403` and never falls back to a host PTY.
 
 **Plan (containment, not command filtering):**
 
@@ -599,23 +605,31 @@ renders what the server allows.
 | --- | --- | --- | --- |
 | **Pair coding** (current) | 2–3 trusted people | read-write, terminal on | editor + terminal + call |
 | **Remote work** | owner's other machines / clean setups | read-write for the host role only, screen-share-centric | workspace dock layout, host desktop screen share (`getDisplayMedia` on the host), terminal gated to the host role |
-| **Interview** | interviewer + candidate | candidate read-only in a seeded folder, no terminal (or §8.2-sandboxed only), no deletion | low-chrome editor, interview timer, question/notes pane, interviewer side panel, call dock visible |
+| **Interview** | interviewer + candidate | candidate writes only in a seeded folder, read-only elsewhere; Docker-only terminal; no deletion | low-chrome editor, consent gate, candidate seat, replay data; timer/notes/interviewer side panel still future |
 | **System sharing / presentation** | viewer-only audiences | no filesystem at all, no terminal | full-bleed screen-share grid + chat — a kiosk that ignores the IDE furniture |
 | **Teaching / class** | 1 teacher, N students | per-guest read-only or a personal scratch directory each | roster + moderator controls, spotlight, "follow the teacher" view-sync |
+
+**Shipped in 0.7.0:** the interview profile is now a room profile, created with
+`profile: "interview"` through the room-scoped admin API. It seeds `solution/`, installs
+the candidate policy, adds the candidate seat/token/invite role, gates admission on
+consent, records bounded integrity data, and exposes the data-only replay route. The
+candidate terminal is Docker-only and fail-closed; the ordinary editor/owner terminal is
+unchanged.
 
 **Implementation shape:**
 
 1. **Profile registry on the server:** `profiles.ts` exporting
    `{ id, permissions: { files: 'rw' | 'ro' | 'none', terminal, download,
-   call, chat } , defaults }`, attached at session (later per-room) creation
-   via `--profile interview`. The existing `--mode` / `--no-terminal` flags
-   fold into this matrix, and `/api/session` ships the effective permissions
+   call, chat } , defaults }`, attached at room creation with
+   `profile: "interview"`. The existing `--mode` / `--no-terminal` flags
+   remain session-wide defaults, and `/api/session` ships the effective permissions
    so the UI can trim itself.
 2. **Mode-aware client:** a `ProfileProvider` picks the layout and lazy-loads
    the module's feature strips (interview clock, kiosk grid, roster) so the
    pair-coding bundle doesn't grow.
-3. **Per-room profiles (phase 2)** — the room registry now exists; the next step is
-   attaching a profile to each room so one daemon can host several postures at once.
+3. **Per-room profiles (phase 2)** — shipped for interview rooms in 0.7.0; the remaining
+   work is a Host-console room picker so profiles can be created and selected without the
+   admin API.
 4. **Authoritative server:** all mode enforcement stays server-side (path
    guard flags, terminal gating, call scope); the UI is cosmetic only.
 
@@ -627,8 +641,8 @@ renders what the server allows.
    console to live in.
 3. **§8.3 Meet-style rooms** — finish room management UI, host transfer and chat on top
    of the shipped registry, lobby and moderation.
-4. **§8.5 profiles** — interview mode first (tightest real use-case), then
-   system-sharing kiosk, then teaching.
+4. **§8.5 profiles** — interview mode shipped in 0.7.0; next are the system-sharing kiosk
+   and teaching profiles, plus the interview timer/notes/interviewer side-panel UI.
 5. **§8.1 deep track (self-hosted relay, P2P data channels, TURN)** —
    continuous work, sized against how much the managed tunnel gets used.
 

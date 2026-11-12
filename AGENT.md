@@ -207,6 +207,57 @@ has to pass the lobby.
   is 401 for new HTTP requests and WebSocket upgrades; sockets that are already open keep
   working.
 
+## Interview profile
+
+An interview room is an ordinary room with an additive `candidate` seat. Create it through
+the room-scoped admin API (the `/host` UI still drives the default room):
+
+```json
+POST /admin/api/rooms
+{ "path": "/path/to/project", "profile": "interview", "candidateDir": "solution" }
+```
+
+Creation seeds the candidate directory and installs room policy rules: `solution` and
+`solution/**` are `rw`, `**` is `r` for every role in that room. The candidate directory is
+realpath-checked; a symlink resolving outside the room is rejected (`400
+INVALID_CANDIDATE_DIR`) because Docker resolves bind-mount sources on the Host. The room
+returns a fourth, candidate token in addition to owner/editor/viewer.
+
+`candidate` has exactly `fs.read`, `fs.write` and `call.join` — no `fs.delete` and no
+`term.use`. The lobby ceiling allows a candidate token to be seated only as `candidate`;
+an editor/viewer attempt is `403 ROLE_CEILING`.
+
+### Consent and integrity data
+
+`POST /api/lobby/join` requires `{ "consent": true }` for a candidate (`403
+CONSENT_REQUIRED` otherwise). No lobby entry, document update, snapshot or integrity event
+exists before acceptance, and declining starts nothing. The manifest lives in
+`server/src/interview/interviewStore.ts` and is returned in the candidate `/api/session`
+payload; the client renders that exact list before joining.
+
+After admission, candidate updates are recorded with path, connection id and typed/paste
+character counts; snapshots are content-bearing. Bounds: 2,000 events, 2,000 updates, 256
+snapshots, 4 MB snapshot total, explicit truncation flags. `POST /api/integrity` is
+authenticated, candidate-only, consent-gated, and accepts at most 100 events per batch.
+`GET /admin/api/rooms/:roomId/replay` is admin-only and returns the data-only replay.
+Integrity signals are client-reported; they are review evidence, never a tamper-proof
+detector.
+
+### Candidate terminal
+
+`--interview-sandbox` enables the Docker probe at startup: `docker version`, then `docker
+image inspect` for `--interview-sandbox-image` (default `node:22-bookworm-slim`). CodePair
+never pulls, builds or installs. When available, the candidate branch spawns only
+`docker run` with `--rm --interactive --tty --network none --cpus 1 --memory 512m
+--pids-limit 128 --cap-drop ALL --security-opt no-new-privileges --user 1000:1000
+--workdir /workspace`, a `/tmp` tmpfs with `HOME=/tmp`, the project root mounted `:ro`, and
+only `<root>/solution` mounted `:rw`.
+
+If the probe fails, the candidate terminal closes with `4403` and a sandbox-specific reason;
+no host PTY is spawned and there is no fallback. Non-candidate terminals keep the existing
+host `term.use` path. The Docker-available path is covered with an injected spawn seam and
+exact argv assertions; no image is pulled by the test suite.
+
 ## Filesystem sandboxing
 
 `PathGuard.resolve()` applies two independent checks to every client-supplied path:
@@ -403,8 +454,8 @@ authenticated clients, which mirrors how any client that may call needs them.
 
 ```bash
 npm run typecheck     # tsc for server + client
-npm test              # Vitest: 215 tests — sandbox, policy, API, admin, lobby, invites, rooms, moderation, doc sync, terminal
-npm run build         # Vite client build + server tsc
+npm test              # Vitest: 226 tests — sandbox, policy, API, admin, lobby, invites, rooms, moderation, interview, doc sync, terminal
+npm run build         # Vite client build + tsup server bundle
 npm run dev           # tsx watch server + Vite client
 ```
 

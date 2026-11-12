@@ -43,16 +43,21 @@ Host machine                                    Remote clients
   choke point across the tree, search, reads, mutations and document sockets; built-in
   secret defaults stay hidden until the Host explicitly confirms unhiding.
 - **Join approval (lobby)** — every guest token waits in a queue until the Host admits it
-  as editor or viewer, denies it, or lets it expire; the Host can lock the room and kick a
-  tab at any moment. `--no-lobby` restores the old "open the link and you are in" flow.
+  as editor, viewer, or interview candidate, denies it, or lets it expire; the Host can
+  lock the room and kick a tab at any moment. `--no-lobby` restores the old "open the link
+  and you are in" flow.
 - **Multiple rooms per daemon** — the default room keeps its original startup link; the
   loopback Host API can create additional rooms at other canonical roots. Each room owns
   its tokens, lobby, invites, root, documents, PTYs and signalling, and a room selector is
   never a credential.
+- **Interview profile** — an admin-created interview room adds a consent-gated candidate
+  seat, a seeded writable `solution/` folder, bounded integrity signals, data-only replay,
+  and a Docker-only candidate terminal that fails closed with `4403` when Docker or the
+  image is unavailable. Ordinary editor/viewer terminals remain host PTYs.
 - **Expiring invite links and live token rotation** — the Host console mints expiring,
-  limited-use editor/viewer/candidate links; each redemption becomes a real token and still waits in
-  the lobby. Rotating a role revokes that role's pending invites and stops its old token
-  for new connections, while existing sockets keep working.
+  limited-use editor/viewer/candidate links; each redemption becomes a real token and
+  still waits in the lobby. Rotating a role revokes that role's pending invites and stops
+  its old token for new connections, while existing sockets keep working.
 - **Tunnel status at a glance** — the Host console reports whether a tunnel is configured
   and running, shows the public URL with a QR code when live, and says whether
   `cloudflared` is installed. It never downloads or executes a fetched binary.
@@ -556,14 +561,17 @@ CODE_PAIR_ICE_SERVERS='[
 
 ## Testing
 
-Currently 215 server tests (14 files) and 28 browser checks. The suite covers the original
+Currently 226 server tests (16 files) and 28 browser checks. The suite covers the original
 single-room behavior plus room creation, selector-vs-credential isolation, cross-room
-connection ids, room invites, scoped root switches, deletion teardown, and call moderation
-(grants, mute relay, spotlight, hand raise and call-only removal). The committed browser
-run covers file loading, concurrent edits, presence, remote cursors, terminal, 401 and
+connection ids, room invites, scoped root switches, deletion teardown, call moderation
+(grants, mute relay, spotlight, hand raise and call-only removal), and the interview
+profile (candidate policy, consent gate, bounded integrity data, replay, role ceiling,
+symlink escape, and the Docker-only fail-closed terminal). The committed browser run
+covers file loading, concurrent edits, presence, remote cursors, terminal, 401 and
 traversal rejection, the share QR, mobile and landscape layout, one-use invite redemption,
 and root switching. Set `CODE_PAIR_ADMIN_TOKEN` to include the admin-driven invite and
-root-switch checks.
+root-switch checks. The temporary 13-check interview browser pass is described in
+`REPORT.md` but is not committed to `e2e/browser.mjs`.
 
 ```bash
 npm run typecheck     # tsc for server + client
