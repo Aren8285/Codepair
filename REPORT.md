@@ -203,6 +203,27 @@ restored; the SHA-256 of both files matched the backups after the run.
 | eviction no longer skips blocked ids (`invites.ts`) | `expected +0 to be 10` — the blocked id was evicted |
 | all-blocked overflow drops the new id (`invites.ts`) | `expected +0 to be 1` — fresh id was not tracked |
 
+### Mutation checks (0.6.0 rooms and moderation, post-release)
+
+Run against the committed 0.6.0 tree on 2026-11-12. Each mutation was applied to a
+backed-up file, the covering test was run, and the file was restored; the SHA-256 before
+mutation and after restore matched for all three files.
+
+| Mutation | Red result |
+| --- | --- |
+| room comparison removed from `ConnectionRegistry.claim()` (`server/src/lobby/connections.ts`) | `room registry > rejects a connection id claimed by room A when it is presented to room B`: `AssertionError: expected 200 to be 403 // Object.is equality` at `rooms.test.ts:158` |
+| `isModerator` gates removed from `mute-request`, `spotlight` and `kick-from-call` (`server/src/signaling/signalingHub.ts`) | `call moderation > grant is live-socket scoped: a brief drop revokes it even with the same connection id`: `Error: Timed out waiting for a signalling message.` at `signaling.test.ts:89` — the expected `FORBIDDEN`/403 never arrived, so the test failed at the 403 wait rather than a value assertion |
+| default-room and last-room guards removed from `RoomRegistry.dispose()` (`server/src/rooms/roomRegistry.ts`) | `room registry > deletes a non-default room and tears down its documents, PTYs and sockets`: `AssertionError: expected 204 to be 409 // Object.is equality` at `rooms.test.ts:300` |
+
+| File | SHA-256 before mutation | SHA-256 after restore |
+| --- | --- | --- |
+| `server/src/lobby/connections.ts` | `6f75c028ade8625671877d995b839d7da2f7bbd47bcb3eab44481a8b5e22d6d9` | `6f75c028ade8625671877d995b839d7da2f7bbd47bcb3eab44481a8b5e22d6d9` |
+| `server/src/signaling/signalingHub.ts` | `c0464a896cf26cc843c74bcd92d61d0a1cc0abf4091213672320f78b803a5cd1` | `c0464a896cf26cc843c74bcd92d61d0a1cc0abf4091213672320f78b803a5cd1` |
+| `server/src/rooms/roomRegistry.ts` | `31e558401083a19be0d92e0ff3eb90fea43d6eac5c54312d8bc1a7df74a70983` | `31e558401083a19be0d92e0ff3eb90fea43d6eac5c54312d8bc1a7df74a70983` |
+
+All three restored byte-identically. `git diff --exit-code` against `ade7c7c` for the
+three mutated files returned 0, and the working tree was clean before this report update.
+
 ---
 
 ## 4. Real bugs found by testing, and how they were fixed
@@ -676,6 +697,9 @@ fallback) — that decision decides how much of §8.2 lands in phase 1 vs phase 
   the original 206 remain green), typecheck 0, build 0, diff check 0, and 28/28 real-Chrome
   checks against the built app on room `e119-1687`. The browser run covered two clients,
   disk persistence, terminal, invites/lobby, root switches and responsive layout.
+* **Mutation checks (post-release follow-up).** Three mutations covering cross-room
+  connection claims, the call-moderation gate, and default/last-room deletion all went red
+  and were restored byte-identically; exact results and hashes are in §3.
 * **Limitations.** The participant drawer was not browser-exercised; multi-room browser
   coverage is absent (server integration covers it); host transfer is omitted by design;
   room and moderation state are in memory. No new dependencies. PathGuard, FileService
