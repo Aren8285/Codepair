@@ -22,6 +22,9 @@ Options:
   --lobby-timeout <sec>     Pending request lifetime, 1-3600 (default: 120)
   --allow-origin <origin>   Extra WebSocket origin allowed (repeatable)
   --no-terminal             Disable the remote terminal (explicit opt-out)
+  --interview-sandbox       Enable the Docker-only candidate terminal sandbox
+  --interview-sandbox-image Docker image for the candidate sandbox
+                            (default: node:22-bookworm-slim; never pulled)
   --rule <glob=access>      Path rule: hidden, r or rw (repeatable, max 50)
   --confirm-unhide          Let --rule lift a built-in secret default
   --tunnel <provider>       "cloudflare" or "ngrok" public tunnel
@@ -35,7 +38,7 @@ Environment:
   CODE_PAIR_MODE, CODE_PAIR_TOKEN, CODE_PAIR_PORT, CODE_PAIR_ADMIN_PORT, CODE_PAIR_HOST,
   CODE_PAIR_ALLOW_ORIGINS, CODE_PAIR_DEV_CLIENT, CODE_PAIR_TERMINAL=off,
   CODE_PAIR_TUNNEL, CODE_PAIR_ICE_SERVERS, CODE_PAIR_MAX_FILE_BYTES,
-  CODE_PAIR_SAVE_DEBOUNCE_MS, CODE_PAIR_IGNORE
+  CODE_PAIR_SAVE_DEBOUNCE_MS, CODE_PAIR_IGNORE, CODE_PAIR_INTERVIEW_SANDBOX_IMAGE
 
 Security note:
   Holding the access token is equivalent to being allowed to edit this project
@@ -50,7 +53,7 @@ async function main(): Promise<void> {
     return;
   }
   if (argv.includes('--version')) {
-    process.stdout.write('0.6.0\n');
+    process.stdout.write('0.7.0\n');
     return;
   }
 

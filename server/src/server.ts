@@ -36,11 +36,19 @@ import { SandboxError, type PathGuard } from './security/pathGuard.js';
 import type { Session } from './session/session.js';
 import { RoomRegistry, type Room } from './rooms/roomRegistry.js';
 import { createTunnelState, type TunnelStatus } from './tunnelStatus.js';
+import { probeInterviewSandbox, type InterviewSandboxStatus } from './terminal/interviewSandbox.js';
+import type { TerminalSpawn } from './terminal/terminalService.js';
+import {
+  MAX_EVENT_BATCH,
+  type DisplaySurface,
+  type IntegrityEventInput,
+  type IntegrityEventType,
+} from './interview/interviewStore.js';
 
 export { CAPABILITY_GATE, requireCap };
 export type { CapabilityGate } from './security/gate.js';
 
-export const SERVER_VERSION = '0.6.0';
+export const SERVER_VERSION = '0.7.0';
 
 declare global {
   namespace Express {
@@ -85,6 +93,11 @@ export interface CreateServerOptions {
   tunnelStatus?: () => TunnelStatus;
   /** Test seam: clock used by the session's invite store. */
   inviteNow?: () => number;
+  /** Test seam: injectable Docker probe; never installs or pulls Docker. */
+  sandboxProbe?: (image: string) => Promise<InterviewSandboxStatus>;
+  /** Test seams for the normal and candidate terminal spawn paths. */
+  terminalSpawn?: TerminalSpawn;
+  sandboxSpawn?: TerminalSpawn;
 }
 
 export async function createCodepairServer(
@@ -144,6 +157,14 @@ export async function createCodepairServer(
     }
   };
 
+  const interviewSandbox = config.interviewSandbox
+    ? await (options.sandboxProbe ?? probeInterviewSandbox)(config.interviewSandboxImage)
+    : {
+        available: false,
+        image: config.interviewSandboxImage,
+        reason: 'The candidate interview sandbox is disabled on this server.',
+      };
+
   // The default room and every additional room share the daemon's socket and
   // lifecycle infrastructure, but own their session, tokens and signalling.
   const tokenStore = new TokenStore(config.tokens);
@@ -158,6 +179,9 @@ export async function createCodepairServer(
       ignored,
       lobby: { enabled: config.lobbyEnabled, timeoutMs: config.lobbyTimeoutMs },
       inviteNow: options.inviteNow,
+      interviewSandbox,
+      terminalSpawn: options.terminalSpawn,
+      sandboxSpawn: options.sandboxSpawn,
     },
     broadcastLobby,
   );
@@ -263,7 +287,10 @@ export async function createCodepairServer(
     const session = room.session;
     // Reachable while waiting on purpose (the waiting screen needs it), and an
     // admitted seat can only narrow what this tab is told it may do.
-    const principal = effectivePrincipal(session, principalOf(request), connectionIdOf(request));
+    const connectionId = connectionIdOf(request);
+    const principal = effectivePrincipal(session, principalOf(request), connectionId);
+    const sandboxAvailable =
+      config.terminalEnabled && session.terminals.interviewSandbox?.available === true;
     response.setHeader('Cache-Control', 'no-store');
     response.json({
       role: principal.role,
@@ -279,6 +306,17 @@ export async function createCodepairServer(
       startedAt,
       limits: { maxFileBytes: config.maxFileBytes },
       rtc: { iceServers: config.iceServers },
+      ...(principal.role === 'candidate'
+        ? {
+            interview: {
+              consentRequired: !connectionId || !session.interview.hasConsent(connectionId),
+              consent: session.interview.manifest,
+              // A convenience/fairness measure, not a security boundary.
+              monacoSuggestions: false,
+              sandboxTerminalAvailable: sandboxAvailable,
+            },
+          }
+        : {}),
     });
   });
 
@@ -295,10 +333,22 @@ export async function createCodepairServer(
       if (!connectionId) {
         throw new AppError(403, 'LOBBY_REQUIRED', 'A connection id is required to join the lobby.');
       }
-      claimConnection(connections, room.id, connectionId);
       const body = asRecord(request.body);
       const displayName = typeof body.displayName === 'string' ? body.displayName : '';
-      response.json(session.lobby.request(connectionId, displayName, guestRoleOf(principal)));
+      const role = guestRoleOf(principal);
+      if (role === 'candidate') {
+        const consented = session.interview.hasConsent(connectionId) || body.consent === true;
+        if (!consented) {
+          throw new AppError(
+            403,
+            'CONSENT_REQUIRED',
+            'Accept the interview logging notice before joining.',
+          );
+        }
+        if (body.consent === true) session.interview.grantConsent(connectionId);
+      }
+      claimConnection(connections, room.id, connectionId);
+      response.json(session.lobby.request(connectionId, displayName, role));
     }),
   );
 
@@ -362,6 +412,33 @@ export async function createCodepairServer(
     const query = typeof request.query.q === 'string' ? request.query.q.slice(0, 200) : '';
     response.json(await session.access(principalOf(request)).search(query));
   }));
+
+  app.post(
+    '/api/integrity',
+    requireCap('fs.read'),
+    asyncRoute(async (request, response) => {
+      const session = roomOf(request).session;
+      const principal = principalOf(request);
+      const connectionId = connectionIdOf(request);
+      if (principal.role !== 'candidate') {
+        throw new AppError(403, 'INTERVIEW_ONLY', 'Integrity signals are accepted only from an interview candidate.');
+      }
+      if (!connectionId) {
+        throw new AppError(403, 'LOBBY_REQUIRED', 'A connection id is required to log integrity signals.');
+      }
+      if (!session.interview.hasConsent(connectionId)) {
+        throw new AppError(403, 'CONSENT_REQUIRED', 'Accept the interview logging notice before logging signals.');
+      }
+      const body = asRecord(request.body);
+      const rawEvents = body.events;
+      if (!Array.isArray(rawEvents) || rawEvents.length === 0 || rawEvents.length > MAX_EVENT_BATCH) {
+        throw new AppError(400, 'BAD_REQUEST', `events must contain 1-${MAX_EVENT_BATCH} entries.`);
+      }
+      const events = rawEvents.map((entry) => validateIntegrityEvent(entry));
+      const accepted = session.interview.record(connectionId, events);
+      response.status(202).json({ accepted });
+    }),
+  );
 
   app.post('/api/files', requireCap('fs.write'), asyncRoute(async (request, response) => {
     const session = roomOf(request).session;
@@ -600,7 +677,10 @@ export async function createCodepairServer(
             docWss.handleUpgrade(request, socket, head, (webSocket) => {
               docWss.emit('connection', webSocket, request);
               track(webSocket, room.id, upgradeConnectionId);
-              session.documents.connect(docPath, webSocket, decision.write, access.view);
+              session.documents.connect(docPath, webSocket, decision.write, access.view, {
+                connectionId: upgradeConnectionId,
+                role: upgradePrincipal.role,
+              });
             });
             return;
           }
@@ -613,7 +693,10 @@ export async function createCodepairServer(
         docWss.handleUpgrade(request, socket, head, (webSocket) => {
           docWss.emit('connection', webSocket, request);
           track(webSocket, room.id, upgradeConnectionId);
-          session.documents.connect(docPath, webSocket, decision.write, access.view);
+          session.documents.connect(docPath, webSocket, decision.write, access.view, {
+                connectionId: upgradeConnectionId,
+                role: upgradePrincipal.role,
+              });
         });
       })();
       return;
@@ -811,8 +894,11 @@ function connectionIdOf(request: Request): string | undefined {
 }
 
 /** The guest instances of `Role`, narrowed for the lobby (host never reaches here). */
-function guestRoleOf(principal: Principal): 'owner' | 'editor' | 'viewer' {
-  return principal.role === 'owner' || principal.role === 'editor' ? principal.role : 'viewer';
+function guestRoleOf(principal: Principal): 'owner' | 'editor' | 'viewer' | 'candidate' {
+  if (principal.role === 'owner' || principal.role === 'editor' || principal.role === 'candidate') {
+    return principal.role;
+  }
+  return 'viewer';
 }
 
 /** A seat may only narrow a token's capabilities, never widen them. */
@@ -912,6 +998,45 @@ function queryString(value: unknown, fallback: string): string {
 function requiredQuery(value: unknown): string {
   if (typeof value !== 'string' || value.length === 0) throw badRequest('path query parameter is required.');
   return value;
+}
+
+const INTEGRITY_EVENT_TYPES: ReadonlySet<string> = new Set([
+  'visibility',
+  'blur',
+  'focus',
+  'fullscreen-enter',
+  'fullscreen-exit',
+  'paste',
+  'screen-share-surface',
+]);
+const DISPLAY_SURFACES: ReadonlySet<string> = new Set(['monitor', 'window', 'browser', 'unknown']);
+
+function validateIntegrityEvent(value: unknown): IntegrityEventInput {
+  const event = asRecord(value);
+  if (typeof event.type !== 'string' || !INTEGRITY_EVENT_TYPES.has(event.type)) {
+    throw badRequest('Each integrity event must have a known type.');
+  }
+  const path = event.path;
+  if (path !== undefined && (typeof path !== 'string' || path.length === 0 || path.length > 300 || path.includes('\u0000'))) {
+    throw badRequest('Integrity event path must be a short relative path.');
+  }
+  const size = event.size;
+  if (
+    size !== undefined &&
+    (typeof size !== 'number' || !Number.isInteger(size) || size < 0 || size > 10_000_000)
+  ) {
+    throw badRequest('Integrity event size must be a non-negative integer.');
+  }
+  const surface = event.surface;
+  if (surface !== undefined && (typeof surface !== 'string' || !DISPLAY_SURFACES.has(surface))) {
+    throw badRequest('Integrity event surface must be monitor, window, browser or unknown.');
+  }
+  return {
+    type: event.type as IntegrityEventType,
+    ...(path !== undefined ? { path } : {}),
+    ...(size !== undefined ? { size } : {}),
+    ...(surface !== undefined ? { surface: surface as DisplaySurface } : {}),
+  };
 }
 
 function normalizeBodyParserError(error: unknown): AppError | undefined {

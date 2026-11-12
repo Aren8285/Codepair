@@ -3,6 +3,13 @@ import type { WebSocket } from 'ws';
 import { PathGuard } from '../security/pathGuard.js';
 import { can, type Principal } from '../security/principal.js';
 import { cleanupShellSetup, createShellSetup, type ShellSetup } from './shellEnv.js';
+import {
+  buildInterviewSandboxInvocation,
+  normalizeCandidateDir,
+  type InterviewSandboxStatus,
+} from './interviewSandbox.js';
+
+export type TerminalSpawn = typeof pty.spawn;
 
 const MAX_INPUT_CHARS = 64 * 1024;
 const WS_OPEN = 1;
@@ -11,6 +18,13 @@ interface TerminalOptions {
   /** Server-wide feature flag: `--no-terminal` wins over any principal. */
   enabled: boolean;
   logger?: Pick<Console, 'error' | 'warn'>;
+  /** Candidate sandbox availability and the writable subdirectory. */
+  sandbox?: InterviewSandboxStatus;
+  sandboxCandidateDir?: string;
+  /** Test seam for the normal host PTY path. */
+  spawn?: TerminalSpawn;
+  /** Test seam for the candidate sandbox path. */
+  sandboxSpawn?: TerminalSpawn;
 }
 
 interface TerminalSession {
@@ -61,44 +75,97 @@ export class TerminalService {
       socket.close(4403, 'The terminal is disabled on this server.');
       return;
     }
-    // Checked before `pty.spawn` below, so a principal without term.use never
-    // creates a child process.
-    // TODO(iter2): generic permission message
-    if (!can(principal, 'term.use')) {
-      socket.close(4403, 'The terminal is disabled in read-only mode.');
-      return;
-    }
-    if (!this.setup) {
-      socket.close(4500, 'The terminal could not be started.');
-      return;
-    }
 
     let terminal: pty.IPty;
-    try {
-      terminal = pty.spawn(this.setup.shell, this.setup.args, {
-        name: 'xterm-256color',
-        cols: 80,
-        rows: 24,
-        cwd: this.guard.root,
-        env: this.setup.env,
-      });
-    } catch (error) {
-      this.logger.error('[codepair] PTY spawn failed:', error);
-      socket.close(4500, 'The terminal could not be started.');
-      return;
+    let shellName: string;
+    let intro: string;
+
+    if (principal.role === 'candidate') {
+      // Categorically separate from the host terminal: a candidate gets a
+      // sandboxed shell or nothing. There is no fall-through to `term.use` or
+      // to the host PTY. This branch is intentionally before both checks.
+      if (!this.options.sandbox?.available) {
+        socket.close(
+          4403,
+          this.options.sandbox?.reason
+            ? `The sandboxed interview terminal is unavailable: ${this.options.sandbox.reason}`
+            : 'The sandboxed interview terminal is unavailable.',
+        );
+        return;
+      }
+      let candidateDir: string;
+      let invocation;
+      try {
+        candidateDir = normalizeCandidateDir(this.options.sandboxCandidateDir ?? 'solution');
+        invocation = buildInterviewSandboxInvocation({
+          root: this.guard.root,
+          candidateDir,
+          image: this.options.sandbox.image,
+        });
+      } catch (error) {
+        this.logger.error('[codepair] invalid interview sandbox specification:', error);
+        socket.close(4403, 'The sandboxed interview terminal is unavailable.');
+        return;
+      }
+      try {
+        const spawn = this.options.sandboxSpawn ?? pty.spawn;
+        terminal = spawn(invocation.file, invocation.args, {
+          name: 'xterm-256color',
+          cols: 80,
+          rows: 24,
+          cwd: this.guard.root,
+          env: { ...process.env, TERM: 'xterm-256color' },
+        });
+      } catch (error) {
+        this.logger.error('[codepair] interview sandbox spawn failed:', error);
+        socket.close(4403, 'The sandboxed interview terminal could not be started.');
+        return;
+      }
+      shellName = 'docker';
+      intro =
+        `\r\n\u001b[38;5;39mCodePair\u001b[0m \u001b[38;5;242msandboxed interview terminal\u001b[0m\r\n` +
+        `\u001b[38;5;242mNo network. Only ${candidateDir}/ is writable; the rest of the project is read-only.\u001b[0m\r\n` +
+        `\u001b[38;5;242mThis container is removed when the terminal closes.\u001b[0m\r\n\r\n`;
+    } else {
+      // Checked before `pty.spawn` below, so a principal without term.use never
+      // creates a child process.
+      // TODO(iter2): generic permission message
+      if (!can(principal, 'term.use')) {
+        socket.close(4403, 'The terminal is disabled in read-only mode.');
+        return;
+      }
+      if (!this.setup) {
+        socket.close(4500, 'The terminal could not be started.');
+        return;
+      }
+      try {
+        // Deliberately resolved at spawn time so the existing node-pty spy in the
+        // terminal tests still observes the normal host path.
+        const spawn = this.options.spawn ?? pty.spawn;
+        terminal = spawn(this.setup.shell, this.setup.args, {
+          name: 'xterm-256color',
+          cols: 80,
+          rows: 24,
+          cwd: this.guard.root,
+          env: this.setup.env,
+        });
+      } catch (error) {
+        this.logger.error('[codepair] PTY spawn failed:', error);
+        socket.close(4500, 'The terminal could not be started.');
+        return;
+      }
+      shellName = this.setup.shellName;
+      intro =
+        `\r\n\u001b[38;5;39mCodePair\u001b[0m \u001b[38;5;242mterminal\u001b[0m\r\n` +
+        `\u001b[38;5;242mThe shell starts in the project root. It is a real PTY on the host.\u001b[0m\r\n\r\n`;
     }
 
     const session: TerminalSession = { socket, process: terminal, closed: false };
     this.sessions.add(session);
 
     const rootName = this.guard.root.split(/[\\/]/).filter(Boolean).pop() ?? 'project';
-    this.send(session, { type: 'ready', shell: this.setup.shellName, rootName });
-    this.sendOutput(
-      session,
-      `\r\n\u001b[38;5;39mCodePair\u001b[0m \u001b[38;5;242mterminal\u001b[0m\r\n` +
-        `\u001b[38;5;242mProject: ${rootName}\u001b[0m\r\n` +
-        `\u001b[38;5;242mThe shell starts in the project root. It is a real PTY on the host.\u001b[0m\r\n\r\n`,
-    );
+    this.send(session, { type: 'ready', shell: shellName, rootName });
+    this.sendOutput(session, intro);
 
     terminal.onData((data) => this.sendOutput(session, data));
 
@@ -154,6 +221,11 @@ export class TerminalService {
   /** Directory holding the generated rc files; removed by `dispose`. */
   get shellSetupDir(): string | undefined {
     return this.setup?.rcDir;
+  }
+
+  /** GO 1 stub: exposed for the session payload in GO 2. */
+  get interviewSandbox(): InterviewSandboxStatus | undefined {
+    return this.options.sandbox;
   }
 
   dispose(options: { closeCode?: number; reason?: string } = {}): void {

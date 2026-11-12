@@ -12,7 +12,7 @@ export const CAPABILITIES = [
 
 export type Capability = (typeof CAPABILITIES)[number];
 
-export type Role = 'owner' | 'editor' | 'viewer' | 'host';
+export type Role = 'owner' | 'editor' | 'viewer' | 'candidate' | 'host';
 
 export interface Principal {
   /** Assigned per connection; never shared between requests or sockets. */
@@ -27,6 +27,10 @@ export const ROLE_CAPABILITIES: Record<Role, readonly Capability[]> = {
   owner: ['fs.read', 'fs.write', 'fs.delete', 'term.use', 'call.join', 'call.moderate'],
   editor: ['fs.read', 'fs.write', 'fs.delete', 'term.use', 'call.join'],
   viewer: ['fs.read', 'call.join'],
+  // The candidate may edit only through the interview room's policy (the
+  // candidate directory is the sole writable path). Terminal access is granted
+  // separately by the sandbox, never through `term.use`.
+  candidate: ['fs.read', 'fs.write', 'call.join'],
   host: ['session.admin'],
 };
 

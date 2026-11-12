@@ -14,6 +14,7 @@ interface EditorPaneProps {
   path: string;
   active: boolean;
   readOnly: boolean;
+  suggestionsEnabled: boolean;
   onStatus: (path: string, status: EditorStatus) => void;
   onPresence: (path: string, participants: Participant[]) => void;
   onCursor: (path: string, cursor: CursorState) => void;
@@ -30,6 +31,7 @@ export function EditorPane({
   path,
   active,
   readOnly,
+  suggestionsEnabled,
   onStatus,
   onPresence,
   onCursor,
@@ -242,6 +244,9 @@ export function EditorPane({
       readOnly,
       domReadOnly: readOnly,
       readOnlyMessage: { value: 'This session is read-only.' },
+      quickSuggestions: suggestionsEnabled,
+      suggestOnTriggerCharacters: suggestionsEnabled,
+      inlineSuggest: { enabled: suggestionsEnabled },
     });
     if (active) window.requestAnimationFrame(() => editor.layout());
   };
@@ -276,6 +281,9 @@ export function EditorPane({
           fixedOverflowWidgets: true,
           mouseWheelZoom: true,
           readOnly,
+          quickSuggestions: suggestionsEnabled,
+          suggestOnTriggerCharacters: suggestionsEnabled,
+          inlineSuggest: { enabled: suggestionsEnabled },
         }}
       />
       {connection === 'reconnecting' || connection === 'connecting' ? (

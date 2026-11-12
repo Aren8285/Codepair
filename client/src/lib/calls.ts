@@ -40,6 +40,8 @@ export interface CallManagerOptions {
   iceServers: IceServer[];
   self: { name: string; color: string };
   onToast?: (kind: 'info' | 'warning' | 'error' | 'success', message: string, detail?: string) => void;
+  /** Reports the display surface the browser chose, never the pixels. */
+  onScreenShareSurface?: (surface: 'monitor' | 'window' | 'browser' | 'unknown') => void;
 }
 
 interface PeerRuntime {
@@ -233,6 +235,14 @@ export class CallManager {
         return;
       }
       this.screenStream = display;
+      const settings = track.getSettings() as { displaySurface?: string };
+      const surface =
+        settings.displaySurface === 'monitor' ||
+        settings.displaySurface === 'window' ||
+        settings.displaySurface === 'browser'
+          ? settings.displaySurface
+          : 'unknown';
+      this.options.onScreenShareSurface?.(surface);
       track.addEventListener('ended', () => this.stopScreenShare());
       for (const runtime of this.peers.values()) {
         await this.attachVideoTrack(runtime, track, display);

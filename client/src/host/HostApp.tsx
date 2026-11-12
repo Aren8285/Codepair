@@ -14,7 +14,7 @@ import {
 import { clearHostToken, loadHostToken, parseHostToken, storeHostToken } from './token';
 
 type StreamState = 'connecting' | 'live' | 'reconnecting';
-const ROLES = ['owner', 'editor', 'viewer'] as const;
+const ROLES = ['owner', 'editor', 'viewer', 'candidate'] as const;
 
 /** Above this many waiting cards the list scrolls instead of the page. */
 export function HostApp() {
@@ -29,7 +29,7 @@ export function HostApp() {
   const [busy, setBusy] = useState<string | null>(null);
   const [kickArm, setKickArm] = useState<string | null>(null);
   const [now, setNow] = useState(() => Date.now());
-  const [inviteRole, setInviteRole] = useState<'editor' | 'viewer'>('editor');
+  const [inviteRole, setInviteRole] = useState<'editor' | 'viewer' | 'candidate'>('editor');
   const [inviteTtl, setInviteTtl] = useState('');
   const [inviteMaxUses, setInviteMaxUses] = useState('');
   const [inviteLink, setInviteLink] = useState('');
@@ -124,7 +124,7 @@ export function HostApp() {
     [fail],
   );
 
-  const admit = (entry: LobbyEntry, role: 'editor' | 'viewer') => {
+  const admit = (entry: LobbyEntry, role: 'editor' | 'viewer' | 'candidate') => {
     if (!api) return;
     void act(`admit:${entry.id}`, async () => {
       await api.admit(entry.id, role);
@@ -339,7 +339,15 @@ export function HostApp() {
                     <span className={`host__badge host__badge--${entry.tokenRole}`}>{entry.tokenRole}</span>
                   </div>
                   <div className="host__card-actions">
-                    {entry.tokenRole === 'viewer' ? (
+                    {entry.tokenRole === 'candidate' ? (
+                      <button
+                        className="button button--primary button--small"
+                        onClick={() => admit(entry, 'candidate')}
+                        disabled={busy === `admit:${entry.id}`}
+                      >
+                        Admit candidate
+                      </button>
+                    ) : entry.tokenRole === 'viewer' ? (
                       <button
                         className="button button--primary button--small"
                         onClick={() => admit(entry, 'viewer')}
@@ -474,10 +482,13 @@ export function HostApp() {
               <select
                 name="invite-role"
                 value={inviteRole}
-                onChange={(event) => setInviteRole(event.target.value as 'editor' | 'viewer')}
+                onChange={(event) => setInviteRole(event.target.value as 'editor' | 'viewer' | 'candidate')}
               >
                 <option value="editor">Editor</option>
                 <option value="viewer">Viewer</option>
+                {tokenRoles.some((entry) => entry.role === 'candidate' && entry.configured) ? (
+                  <option value="candidate">Candidate (interview room)</option>
+                ) : null}
               </select>
             </label>
             <label className="host__field">

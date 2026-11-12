@@ -6,6 +6,8 @@ import { parseConfig, type ServerConfig } from '../../src/config.js';
 import { createCodepairServer, type CodepairServer } from '../../src/server.js';
 import type { Authenticator } from '../../src/security/auth.js';
 import type { TunnelStatus } from '../../src/tunnelStatus.js';
+import type { InterviewSandboxStatus } from '../../src/terminal/interviewSandbox.js';
+import type { TerminalSpawn } from '../../src/terminal/terminalService.js';
 
 export const TEST_TOKEN = 'test-token-0123456789abcdef';
 
@@ -58,6 +60,11 @@ export async function startTestServer(
     tunnelStatus?: TunnelStatus | (() => TunnelStatus);
     /** Test seam: clock used by the session's invite store. */
     inviteNow?: () => number;
+    /** Test seam: injectable Docker probe; never installs or pulls Docker. */
+    sandboxProbe?: (image: string) => Promise<InterviewSandboxStatus>;
+    /** Test seams for the two terminal spawn paths. */
+    terminalSpawn?: TerminalSpawn;
+    sandboxSpawn?: TerminalSpawn;
     /** Interface the guest listener binds to. Defaults to loopback. */
     bindHost?: string;
     /**
@@ -111,6 +118,9 @@ export async function startTestServer(
       ? {}
       : { tunnelStatus: typeof tunnelStatus === 'function' ? tunnelStatus : () => tunnelStatus }),
     ...(options.inviteNow ? { inviteNow: options.inviteNow } : {}),
+    ...(options.sandboxProbe ? { sandboxProbe: options.sandboxProbe } : {}),
+    ...(options.terminalSpawn ? { terminalSpawn: options.terminalSpawn } : {}),
+    ...(options.sandboxSpawn ? { sandboxSpawn: options.sandboxSpawn } : {}),
   });
   const { port, adminPort } = await server.start(0, options.bindHost ?? '127.0.0.1');
   const baseUrl = `http://127.0.0.1:${port}`;

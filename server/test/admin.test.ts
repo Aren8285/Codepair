@@ -321,6 +321,7 @@ describe('admin listener', () => {
       'GET /admin/api/rooms/:roomId/invites',
       'GET /admin/api/rooms/:roomId/lobby',
       'GET /admin/api/rooms/:roomId/policy',
+      'GET /admin/api/rooms/:roomId/replay',
       'GET /admin/api/rooms/:roomId/state',
       'GET /admin/api/rooms/:roomId/tokens',
       'GET /admin/api/state',

@@ -50,7 +50,7 @@ Host machine                                    Remote clients
   its tokens, lobby, invites, root, documents, PTYs and signalling, and a room selector is
   never a credential.
 - **Expiring invite links and live token rotation** — the Host console mints expiring,
-  limited-use editor/viewer links; each redemption becomes a real token and still waits in
+  limited-use editor/viewer/candidate links; each redemption becomes a real token and still waits in
   the lobby. Rotating a role revokes that role's pending invites and stops its old token
   for new connections, while existing sockets keep working.
 - **Tunnel status at a glance** — the Host console reports whether a tunnel is configured
@@ -103,6 +103,8 @@ query strings, `Referer` headers or access logs.
 | `--no-lobby` | lobby on | Admit every authenticated guest immediately; lobby actions then return `409 LOBBY_DISABLED` |
 | `--lobby-timeout <seconds>` | `120` | Pending request lifetime, 1–3600; an unanswered request expires and may retry |
 | `--no-terminal` | terminal on | Explicit Host opt-out of remote shells |
+| `--interview-sandbox` | off | Enable the Docker-only candidate terminal. Requires Docker; no fallback to a host PTY |
+| `--interview-sandbox-image` | `node:22-bookworm-slim` | Image for the candidate sandbox. Inspected, never pulled |
 | `--rule <glob>=<access>` | — | Path rule (`hidden`, `r`, `rw`), repeatable up to 50, validated at startup |
 | `--confirm-unhide` | off | Required when a `--rule` lifts a built-in secret default |
 | `--tunnel <provider>` | off | `cloudflare` or `ngrok` public tunnel |
@@ -115,7 +117,7 @@ Environment equivalents: `CODE_PAIR_MODE`, `CODE_PAIR_TOKEN`, `CODE_PAIR_PORT`,
 `CODE_PAIR_ADMIN_PORT`, `CODE_PAIR_HOST`, `CODE_PAIR_ALLOW_ORIGINS`, `CODE_PAIR_DEV_CLIENT`,
 `CODE_PAIR_TERMINAL=off`, `CODE_PAIR_TUNNEL`, `CODE_PAIR_ICE_SERVERS`,
 `CODE_PAIR_MAX_FILE_BYTES`, `CODE_PAIR_SAVE_DEBOUNCE_MS`, `CODE_PAIR_IGNORE`,
-`CODE_PAIR_CLIENT_DIST`.
+`CODE_PAIR_INTERVIEW_SANDBOX_IMAGE`, `CODE_PAIR_CLIENT_DIST`.
 
 ## Roles and tokens
 
@@ -127,6 +129,7 @@ Every token maps to exactly one role, and the role decides what that session may
 | `host` | `session.admin` | the Host console only; never a guest listener |
 | `editor` | `fs.read`, `fs.write`, `fs.delete`, `term.use`, `call.join` | edit, delete, terminal, calls |
 | `viewer` | `fs.read`, `call.join` | read files, receive live edits, join calls |
+| `candidate` | `fs.read`, `fs.write`, `call.join` | interview rooms only: write inside the candidate folder, no delete, no host terminal |
 
 - `--token` keeps its historical meaning: the **owner** in `read-write`, a **viewer** when
   `--mode read-only` is set.
@@ -144,6 +147,10 @@ Every token maps to exactly one role, and the role decides what that session may
 - **Call moderation is scoped.** The owner holds `call.moderate`. The Host can grant it to
   a live editor or viewer signal connection in one room; the grant is lost when that signal
   socket closes and never becomes part of the role.
+- **Candidate is not a narrow editor.** It has `fs.read` and `fs.write`, but no `fs.delete`
+  or `term.use`. The interview room's access policy makes only `solution/` writable for
+  every role, so the candidate can write there and read the task elsewhere. Its terminal is
+  a separate Docker-sandbox path, never the host PTY.
 
 ## Join lobby
 
@@ -180,8 +187,8 @@ no `--rooms` flag and no room-creation route on the guest listener. A room owns 
 root, token store, lobby, invites, document hub, PTYs and signalling hub.
 
 - **Fresh credentials.** A new room receives new owner/editor/viewer tokens, returned once
-  in the creation response. Existing tokens cannot be revealed again; rotate the role in
-  that room instead.
+  in the creation response; an interview room also receives a candidate token. Existing
+  tokens cannot be revealed again; rotate the role in that room instead.
 - **Selector, not credential.** Guest HTTP requests may send
   `X-CodePair-Room: <roomId>`; WebSockets and share links use `?room=<id>` and
   `/room/<id>`. Omitting the selector targets the default room. The bearer token is always
@@ -247,6 +254,70 @@ permissions, so `cat .env` works even though the editor cannot open it. When any
 shell, the startup banner says so and `GET /admin/api/state` reports
 `terminalBypassesRules: true`; `--no-terminal` removes both the shell and the warning.
 
+## Interview rooms
+
+An interview room is a normal room with an additive profile. Create one through the
+loopback admin API (the room routes are room-scoped; the console UI still drives the
+default room):
+
+```json
+POST /admin/api/rooms
+{ "path": "/path/to/project", "profile": "interview", "candidateDir": "solution" }
+```
+
+The response includes the four tokens once, including `candidate`. Creating the room
+seeds `<root>/solution/` (a directory only; task files are whatever the Host put in the
+root) and installs policy rules that keep `solution` and `solution/**` writable for every
+role in that room, with everything else read-only. The owner of an interview room is also
+read-only outside `solution/` by design.
+
+### Consent is a hard gate
+
+A candidate's first `/api/session` response carries the server's consent manifest. The
+client shows that list and does not ask the lobby to join until the candidate accepts.
+`POST /api/lobby/join` requires `{ "consent": true }` for a candidate; without it the
+request is `403 CONSENT_REQUIRED` and no lobby entry, document update, snapshot or
+integrity event exists. Declining is a neutral dead end: no request is sent and nothing is
+logged. The accepted scope is server-owned, so the UI cannot narrow the notice it shows
+while logging more.
+
+Accepted signals are deliberately small and reviewable, never an automated verdict:
+
+- document updates as typed/paste-sized character counts with the path and connection id;
+- content snapshots per file, capped at 256 snapshots and 4 MB with explicit truncation
+  flags;
+- visibility changes, window blur/focus, fullscreen enter/exit, paste size/target path, and
+  the browser-reported `displaySurface` when the candidate shares a screen (`monitor`,
+  `window`, `browser` or `unknown`).
+
+Paste content, editor text and screen pixels are never sent. The candidate sends batches to
+`POST /api/integrity` (authenticated, candidate-only, consent-gated, at most 100 events per
+request); the store keeps at most 2,000 events. The event ring, snapshots and replay payload
+are bounded, and the interviewer can read the data-only replay at
+`GET /admin/api/rooms/:roomId/replay`. This iteration has no scrubber UI. Signals are
+client-reported and a modified client can stop sending them, so they are evidence for a
+human to review, not tamper-proof detection or proof of cheating.
+
+### Candidate terminal is Docker-only and fail-closed
+
+With `--interview-sandbox`, startup runs `docker version` and `docker image inspect` for
+the configured image. It never builds, pulls or installs anything. If the probe fails, the
+candidate terminal closes with **4403** and a sandbox-specific reason; **no host PTY is
+spawned and no fallback exists**. Non-candidate terminals are unchanged.
+
+When available, the candidate shell is an ephemeral container with:
+
+- `--network none`, `--rm`, `--interactive`, `--tty`;
+- `--cpus 1`, `--memory 512m`, `--pids-limit 128`;
+- `--cap-drop ALL`, `--security-opt no-new-privileges`, a non-root `--user`;
+- `--workdir /workspace`, the project root mounted `:ro`, and only
+  `<root>/solution` mounted `:rw` at `/workspace/solution`;
+- the project root mounted read-only at `/workspace`, a `--tmpfs /tmp` with `HOME=/tmp`, and the image's `/bin/sh -l`.
+
+The image must already exist on the Host. The Host can opt into the feature without Docker
+being installed; candidates simply get the closed terminal until Docker and the image are
+available.
+
 ## Host console (admin API)
 
 The Host can move the session to another project at runtime through a separate,
@@ -283,20 +354,21 @@ the admin token in that tab.
 | `GET /admin/api/policy` | current `rules`, the built-in `defaults`, `confirmUnhide`, `terminalBypassesRules` |
 | `PUT /admin/api/policy/rules` | `{ "rules": [{ "pattern": "…", "access": "hidden\|r\|rw" }], "confirmUnhide": false }` → validates, flushes open documents, applies, echoes `rules`/`confirmUnhide`/`affected` |
 | `GET /admin/api/lobby` | live snapshot: `enabled`, `locked`, `pending`, `admitted` |
-| `POST /admin/api/lobby/:id/admit` | `{ "role": "editor" \| "viewer" }` → admits one pending request with that seat |
+| `POST /admin/api/lobby/:id/admit` | `{ "role": "editor" \| "viewer" \| "candidate" }` → admits one pending request with that seat; a candidate token can only be seated as candidate |
 | `POST /admin/api/lobby/:id/deny` | refuses one pending request; that connection becomes terminal |
 | `POST /admin/api/lobby/lock` | `{ "locked": true \| false }` → refuse or resume new joins |
 | `POST /admin/api/connections/:connectionId/kick` | closes that tab's doc/terminal/signal sockets with `4429` and makes its request terminal |
 | `GET /admin/api/invites` | live and exhausted invites, with role, expiry, `maxUses` and `usedCount` |
-| `POST /admin/api/invites` | `{ "role": "editor\|viewer", "ttlMinutes": 5\|null, "maxUses": 1\|null }` → mints a 144-bit invite id |
+| `POST /admin/api/invites` | `{ "role": "editor\|viewer\|candidate", "ttlMinutes": 5\|null, "maxUses": 1\|null }` → mints a 144-bit invite id |
 | `POST /admin/api/invites/:id/revoke` | revokes one invite; redeeming it then fails closed |
-| `GET /admin/api/tokens` | which roles (`owner`, `editor`, `viewer`) have a token configured |
+| `GET /admin/api/tokens` | which roles (`owner`, `editor`, `viewer`, `candidate`) have a token configured |
 | `POST /admin/api/tokens/:role/rotate` | returns a new token once; old token fails new requests, the role's live invites are revoked, existing sockets continue |
 | `GET /admin/api/tunnel` | `configured`, `provider`, `running`, `publicUrl`, `cloudflaredInstalled`, `installInstructions` |
 | `GET /admin/api/events?token=…` | default room SSE: an opening `snapshot` event, then `lobby` on every change, with a 15 s heartbeat |
 | `GET /admin/api/rooms` | rooms with root, creation time, default flag and admitted participant count |
-| `POST /admin/api/rooms` | `{ "path": "…", "confirmBroad": false }` → creates a room and returns its three tokens once |
+| `POST /admin/api/rooms` | `{ "path": "…", "confirmBroad": false, "profile": "interview", "candidateDir": "solution" }` → creates a room and returns its tokens once (four for an interview room) |
 | `DELETE /admin/api/rooms/:roomId` | closes a non-default room and its sockets with `4412` |
+| `GET /admin/api/rooms/:roomId/replay` | data-only interview replay: events, typed/paste sizes, bounded content snapshots and truncation flags |
 | `GET /admin/api/rooms/:roomId/events?token=…` | room-scoped SSE `snapshot` and `lobby` events |
 | `POST /admin/api/rooms/:roomId/moderators` | `{ "connectionId": "…" }` → grants `call.moderate` to a live signal connection |
 
@@ -414,7 +486,14 @@ slides up as an overlay.
    sandbox — a determined operator can still reach anything the Host user can, including
    files the access policy hides from the editor. For hard isolation, run the daemon in a
    container or keep the session `read-only`.
-6. **Prefer `read-only`** for demos and public tunnels, a VPN over a public tunnel, and
+6. **Interview candidate terminal**: when enabled, it is the one terminal path that is not
+   a host PTY. It runs only inside Docker with `--network none`, dropped capabilities,
+   no-new-privileges, a non-root user, resource caps, the project root mounted read-only and only the
+   candidate folder writable. If Docker or the image is unavailable the candidate terminal
+   closes with 4403; there is no host fallback. The container is still a Docker boundary,
+   not a guarantee against a Docker daemon misconfiguration — keep the image minimal and
+   the Host's Docker installation patched.
+7. **Prefer `read-only`** for demos and public tunnels, a VPN over a public tunnel, and
    HTTPS (the built-in tunnel provides it) so tokens and media never cross plaintext.
 
 **Room selection is not authentication.** `X-CodePair-Room` / `?room=` only chooses which

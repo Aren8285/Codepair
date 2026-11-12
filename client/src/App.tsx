@@ -6,6 +6,7 @@ import {
   redeemInvite,
   type FileEntry,
   type LobbyStatus,
+  type RedeemedInvite,
   type SessionInfo,
 } from './lib/api';
 import { baseName, languageForPath, parentDirectory } from './lib/language';
@@ -26,7 +27,9 @@ import { TerminalPanel } from './components/TerminalPanel';
 import { StatusBar } from './components/StatusBar';
 import { TokenGate } from './components/TokenGate';
 import { LobbyScreen, type LobbyGateView } from './components/LobbyScreen';
+import { ConsentScreen } from './components/ConsentScreen';
 import { CallDock } from './components/CallDock';
+import { IntegrityReporter } from './lib/integrity';
 import {
   DeleteDialog,
   NewEntryDialog,
@@ -39,18 +42,16 @@ import { Icon, PairMark } from './components/Icon';
 
 type SessionState = 'idle' | 'loading' | 'ready' | 'error';
 type LobbyView = LobbyGateView | 'admitted';
+type ConsentState = 'pending' | 'accepted' | 'declined';
 type InviteState = 'idle' | 'redeeming' | 'error';
 
 /**
  * StrictMode mounts App twice in development. Keep one redemption promise per
  * invite for the tab's lifetime so a maxUses:1 link cannot be consumed twice.
  */
-const inviteRedemptions = new Map<string, Promise<{ token: string; role: 'editor' | 'viewer' }>>();
+const inviteRedemptions = new Map<string, Promise<RedeemedInvite>>();
 
-function redeemInviteOnce(
-  id: string,
-  roomId: string | null,
-): Promise<{ token: string; role: 'editor' | 'viewer' }> {
+function redeemInviteOnce(id: string, roomId: string | null): Promise<RedeemedInvite> {
   const key = `${roomId ?? ''}:${id}`;
   const existing = inviteRedemptions.get(key);
   if (existing) return existing;
@@ -119,6 +120,7 @@ export function App() {
   const [lobbyView, setLobbyView] = useState<LobbyView>('checking');
   const [lobbyMessage, setLobbyMessage] = useState('');
   const [joinAttempt, setJoinAttempt] = useState(0);
+  const [consentState, setConsentState] = useState<ConsentState>('accepted');
 
   const applyLobbyStatus = useCallback((status: LobbyStatus) => {
     setLobbyMessage('');
@@ -169,11 +171,12 @@ export function App() {
 
   useEffect(() => {
     if (!api || !session || sessionState !== 'ready') return;
+    if (session.role === 'candidate' && consentState !== 'accepted') return;
     let cancelled = false;
     setLobbyView('checking');
     setLobbyMessage('');
     api
-      .joinLobby(currentPresence().name)
+      .joinLobby(currentPresence().name, session.role === 'candidate')
       .then((status) => {
         if (!cancelled) applyLobbyStatus(status);
       })
@@ -183,7 +186,7 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [api, session, sessionState, joinAttempt, applyLobbyStatus, applyLobbyError]);
+  }, [api, session, sessionState, joinAttempt, consentState, applyLobbyStatus, applyLobbyError]);
 
   // While waiting, poll the cheap status route; it is reachable before admission.
   useEffect(() => {
@@ -237,6 +240,9 @@ export function App() {
         if (controller.signal.aborted) return;
         setSession(info);
         setSessionState('ready');
+        setConsentState(
+          info.role === 'candidate' && info.interview?.consentRequired ? 'pending' : 'accepted',
+        );
         setAuthError('');
       })
       .catch((error: unknown) => {
@@ -326,6 +332,19 @@ export function App() {
     );
   }
 
+  if (session.role === 'candidate' && consentState !== 'accepted') {
+    return (
+      <ConsentScreen
+        rootName={session.rootName}
+        items={session.interview?.consent ?? []}
+        declined={consentState === 'declined'}
+        onAccept={() => setConsentState('accepted')}
+        onDecline={() => setConsentState('declined')}
+        onLeave={lock}
+      />
+    );
+  }
+
   if (lobbyView !== 'admitted') {
     return (
       <LobbyScreen
@@ -369,7 +388,11 @@ function Workspace({
   onLobbyLost: () => void;
 }) {
   const readOnly = !session.capabilities.includes('fs.write');
-  const terminalAvailable = session.capabilities.includes('term.use');
+  const candidate = session.role === 'candidate';
+  const terminalAvailable = candidate
+    ? session.interview?.sandboxTerminalAvailable === true
+    : session.capabilities.includes('term.use');
+  const suggestionsEnabled = !candidate || session.interview?.monacoSuggestions !== false;
   const { toasts, push, dismiss } = useToasts();
   const self = useMemo(() => currentPresence(), []);
   const [childrenByDir, setChildrenByDir] = useState<Record<string, FileEntry[] | undefined>>({});
@@ -391,6 +414,7 @@ function Workspace({
   const hostSwitchNotifiedRef = useRef(false);
   /** One toast per path the Host hid, until that tab is opened again. */
   const policyDeniedRef = useRef<Set<string>>(new Set());
+  const integrityRef = useRef<IntegrityReporter | null>(null);
   tabsRef.current = tabs;
   activeRef.current = activePath;
 
@@ -409,11 +433,26 @@ function Workspace({
         iceServers: session.rtc.iceServers,
         self,
         onToast: (kind, message, detail) => notify(kind, message, detail),
+        onScreenShareSurface: (surface) => integrityRef.current?.reportScreenSurface(surface),
       }),
     [token, roomId, session.rtc.iceServers, self, notify],
   );
 
   useEffect(() => () => callManager.destroy(), [callManager]);
+
+  // Candidate integrity evidence starts only after lobby admission, when the
+  // workspace mounts. Nothing is attached on the consent screen.
+  useEffect(() => {
+    if (!candidate) return;
+    const reporter = new IntegrityReporter(api, () => activeRef.current);
+    reporter.attach();
+    integrityRef.current = reporter;
+    return () => {
+      reporter.stop();
+      reporter.detach();
+      integrityRef.current = null;
+    };
+  }, [api, candidate]);
 
   // A seat can end while this tab is open (kick, deny, root switch). Document
   // sockets report 4425/4429 immediately; this slow poll is the net for tabs
@@ -668,16 +707,18 @@ function Workspace({
     if (!terminalAvailable) {
       notify(
         'warning',
-        readOnly ? 'Read-only session' : 'Terminal unavailable',
-        readOnly
-          ? 'The terminal is disabled because this session only allows reading.'
-          : 'The host started CodePair with the terminal disabled.',
+        candidate ? 'Sandbox terminal unavailable' : readOnly ? 'Read-only session' : 'Terminal unavailable',
+        candidate
+          ? 'The Docker sandbox could not be started, so the candidate terminal is disabled.'
+          : readOnly
+            ? 'The terminal is disabled because this session only allows reading.'
+            : 'The host started CodePair with the terminal disabled.',
       );
       return;
     }
     setTerminalOpen((open) => !open);
     setSidebarOpen(false);
-  }, [notify, readOnly, terminalAvailable]);
+  }, [notify, readOnly, terminalAvailable, candidate]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -810,6 +851,7 @@ function Workspace({
                   path={path}
                   active={path === activePath}
                   readOnly={readOnly}
+                  suggestionsEnabled={suggestionsEnabled}
                   onStatus={handleStatus}
                   onPresence={handlePresence}
                   onCursor={handleCursor}

@@ -2,7 +2,7 @@ import { currentConnectionId } from './connection';
 
 export type AccessMode = 'read-only' | 'read-write';
 
-export type Role = 'owner' | 'editor' | 'viewer';
+export type Role = 'owner' | 'editor' | 'viewer' | 'candidate';
 
 export type Capability = 'fs.read' | 'fs.write' | 'fs.delete' | 'term.use' | 'call.join' | 'call.moderate' | 'session.admin';
 
@@ -10,6 +10,20 @@ export interface IceServer {
   urls: string | string[];
   username?: string;
   credential?: string;
+}
+
+export interface ConsentItem {
+  id: string;
+  label: string;
+  detail: string;
+}
+
+export interface CandidateInterview {
+  consentRequired: boolean;
+  consent: ConsentItem[];
+  /** Convenience/fairness only; not a security boundary. */
+  monacoSuggestions: boolean;
+  sandboxTerminalAvailable: boolean;
 }
 
 export interface SessionInfo {
@@ -24,6 +38,8 @@ export interface SessionInfo {
   startedAt: number;
   limits: { maxFileBytes: number };
   rtc: { iceServers: IceServer[] };
+  /** Candidate-only consent and interview flags. */
+  interview?: CandidateInterview;
 }
 
 export type LobbyState = 'none' | 'waiting' | 'admitted' | 'denied' | 'expired' | 'withdrawn' | 'removed';
@@ -33,7 +49,7 @@ export interface LobbyStatus {
   locked: boolean;
   state: LobbyState;
   displayName?: string;
-  seat?: 'editor' | 'viewer';
+  seat?: 'editor' | 'viewer' | 'candidate';
   expiresAt?: number;
 }
 
@@ -43,8 +59,8 @@ export interface LobbyEntry {
   displayName: string;
   requestedAt: number;
   state: string;
-  tokenRole: 'owner' | 'editor' | 'viewer';
-  grantedRole?: 'editor' | 'viewer';
+  tokenRole: 'owner' | 'editor' | 'viewer' | 'candidate';
+  grantedRole?: 'editor' | 'viewer' | 'candidate';
 }
 
 export interface LobbySnapshot {
@@ -54,7 +70,7 @@ export interface LobbySnapshot {
   admitted: Array<{
     connectionId: string;
     displayName: string;
-    role: 'owner' | 'editor' | 'viewer';
+    role: 'owner' | 'editor' | 'viewer' | 'candidate';
     connectedSince: number;
   }>;
 }
@@ -102,7 +118,24 @@ export class ApiError extends Error {
 
 export interface RedeemedInvite {
   token: string;
-  role: 'editor' | 'viewer';
+  role: 'editor' | 'viewer' | 'candidate';
+}
+
+export type IntegrityEventType =
+  | 'visibility'
+  | 'blur'
+  | 'focus'
+  | 'fullscreen-enter'
+  | 'fullscreen-exit'
+  | 'paste'
+  | 'screen-share-surface';
+
+export interface IntegrityEvent {
+  type: IntegrityEventType;
+  path?: string;
+  /** Character count only; never the pasted content. */
+  size?: number;
+  surface?: 'monitor' | 'window' | 'browser' | 'unknown';
 }
 
 /** Exchange an invite link for a real guest token. Unauthenticated by design. */
@@ -144,7 +177,11 @@ export async function redeemInvite(
   }
 
   const redeemed = body as RedeemedInvite | undefined;
-  if (!redeemed || typeof redeemed.token !== 'string' || (redeemed.role !== 'editor' && redeemed.role !== 'viewer')) {
+  if (
+    !redeemed ||
+    typeof redeemed.token !== 'string' ||
+    (redeemed.role !== 'editor' && redeemed.role !== 'viewer' && redeemed.role !== 'candidate')
+  ) {
     throw new ApiError(500, 'INVALID_RESPONSE', 'The host returned an invalid invite response.');
   }
   return redeemed;
@@ -161,11 +198,20 @@ export class ApiClient {
   }
 
   /** Ask the Host to let this tab in; idempotent while a request is pending. */
-  joinLobby(displayName: string): Promise<LobbyStatus> {
+  joinLobby(displayName: string, consent = false): Promise<LobbyStatus> {
     return this.request<LobbyStatus>('/api/lobby/join', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ displayName }),
+      body: JSON.stringify({ displayName, ...(consent ? { consent: true } : {}) }),
+    });
+  }
+
+  /** Candidate-only integrity evidence. Content is never sent. */
+  reportIntegrity(events: IntegrityEvent[]): Promise<{ accepted: number }> {
+    return this.request('/api/integrity', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ events }),
     });
   }
 

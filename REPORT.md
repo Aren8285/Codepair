@@ -1,11 +1,13 @@
 # CodePair — Implementation Report
 
-Version 0.6.0 · macOS arm64 · Node v22.21.1 · npm 10.9.4
+Version 0.7.0 · macOS arm64 · Node v22.21.1 · npm 10.9.4
 
 Base report written at 0.2.0; §1 and §3 are kept current, and the addendum at the end
 records each iteration (0.3.x: host console API, host principal, path policy; 0.4.0: join
 lobby, kick/lock, Host console UI; 0.5.0: expiring invites, live token rotation, tunnel
-status/QR; 0.6.0: room registry, room-scoped administration, call moderation).
+status/QR; 0.6.0: room registry, room-scoped administration, call moderation; 0.7.0:
+interview profile, consent-gated integrity signals, replay data, Docker-only candidate
+terminal).
 
 This report states what was built, what was actually verified (and how), what
 was not verified, and what remains. Nothing below is claimed as working on the
@@ -40,7 +42,11 @@ real processes, or real browser clients.
 | Expiring / limited-use invite links | Built, verified | `server/src/invites/invites.ts`, `server/src/admin/adminApp.ts` |
 | Live role-token rotation | Built, verified | `server/src/security/auth.ts`, `server/src/admin/adminApp.ts` |
 | Tunnel status + QR in Host console | Built; status verified, no live tunnel placed | `server/src/tunnelStatus.ts`, `client/src/host/HostQr.tsx` |
-| Automated tests | 215 server + 28 committed browser checks | `server/test/*`, `e2e/browser.mjs` |
+| Interview profile + candidate seat | Built, verified | `server/src/rooms/roomRegistry.ts`, `server/src/security/principal.ts` |
+| Consent-gated integrity signals + replay data | Built, verified at API/data layer | `server/src/interview/interviewStore.ts`, `client/src/lib/integrity.ts` |
+| Docker-only candidate terminal | Built, verified with injected Docker/spawn seams | `server/src/terminal/interviewSandbox.ts`, `terminalService.ts` |
+| Candidate consent UI | Built, browser-verified in a temporary 13-check pass | `client/src/components/ConsentScreen.tsx`, `client/src/App.tsx` |
+| Automated tests | 226 server + 28 committed browser checks | `server/test/*`, `e2e/browser.mjs` |
 | Installation / environment docs | Written | `AGENT.md` |
 | This report | Written | `REPORT.md` |
 
@@ -162,6 +168,73 @@ screen. 6/6 checks passed.
   page errors.
 * **Build/static.** `npm run typecheck` 0, `npm run build` 0, `git diff --check` 0. No new
   dependencies were added.
+
+### 0.7.0 interview profile verification
+
+* **Server suite.** 226/226 tests in 16 files. The 215 existing tests remain green; the 11
+  new tests are nine interview behavior tests and two critical sandbox tests. Only the two
+  approved route snapshots changed (`POST /api/integrity` and the room replay route).
+* **Typecheck/build.** `npm run typecheck` 0 (server + client), `npm run build` 0 (Vite
+  client bundle + tsup server bundle), `git diff --check` 0. No new server dependencies.
+* **Committed browser suite.** 28/28 real-Chrome checks against the built app, including
+  two clients, disk persistence, the non-candidate host terminal (`node --version`),
+  one-use invite/lobby admission, two root switches, mobile/landscape layout and no console
+  or page errors. The host terminal check is the non-candidate regression signal: the
+  owner still gets a real PTY while the candidate path is separate.
+* **Temporary interview browser pass.** 13/13 checks against the built app with an
+  admin-created interview room: consent screen appears first; declining sends no lobby
+  request and lands on the neutral dead end; no pending entry or replay event exists before
+  acceptance; accepting queues exactly one candidate request; the Host admits the candidate
+  seat; the admitted session carries the server manifest, `fs.read`/`fs.write`/`call.join`
+  and no `fs.delete`/`term.use`; the unavailable sandbox disables the terminal control; and
+  the workspace has no console errors.
+* **Attack → test map.**
+
+| Attack / failure | Covering test |
+| --- | --- |
+| Candidate tries to leave `solution/` | `interview.test.ts`: candidate write outside `solution` is denied by policy |
+| Candidate directory is a symlink outside the room | `interview.test.ts`: creating the interview room returns `400 INVALID_CANDIDATE_DIR` |
+| Candidate tries to delete | `interview.test.ts`: candidate has no `fs.delete` and deletion is refused |
+| Candidate asks for a host shell | `interviewTerminal.test.ts`: candidate branch uses only the sandbox spawn, never the host PTY |
+| Docker is unavailable | `interviewTerminal.test.ts`: close `4403`, sandbox-specific reason, host spawn count 0, sandbox spawn count 0 |
+| Docker is available but flags are weakened | `interviewTerminal.test.ts`: exact `--network none`, `--rm`, caps, pids, non-root, `:ro`/`:rw` mounts and image asserted |
+| Candidate skips consent | `interview.test.ts`: join returns `403 CONSENT_REQUIRED`; no pending entry, event or snapshot exists |
+| Pre-consent client sends signals | `interview.test.ts`: `/api/integrity` returns `403 CONSENT_REQUIRED` |
+| Non-candidate sends integrity events | `interview.test.ts`: `403 INTERVIEW_ONLY` |
+| Candidate is seated as editor/viewer | `interview.test.ts`: `403 ROLE_CEILING`, entry remains waiting |
+| Replay is read by a guest | `admin.test.ts`: room replay route is admin-only |
+| Event flood grows without bound | `interview.test.ts`: 2,000-event ring and the `truncated.events` flag |
+
+### 0.7.0 mutation checks
+
+Each mutation was applied to the uncommitted 0.7.0 tree, the covering test was run, and the
+file was restored from its original text. The table records the full before → mutated →
+restored SHA-256 chain; all four runs restored byte-identically. Mutation 1 was split into
+its two edits after review; 1a and 1b were not combined in the reported runs below.
+
+| Mutation | Result |
+| --- | --- |
+| **1a.** Candidate branch gated on sandbox availability (`terminalService.ts`) — bypasses the sandbox-only branch when Docker is unavailable | Red: `expected 'The terminal is disabled in read-only…' to match /sandbox/i` at `interviewTerminal.test.ts:200`. The host `term.use` gate still blocked the host PTY; the failure is the read-only reason replacing the sandbox reason. |
+| **1b.** Host `term.use` gate skipped for a candidate (`terminalService.ts`), with the candidate branch intact | Inert: both `interviewTerminal.test.ts` tests pass. A candidate still short-circuits into the sandbox branch, so the changed line is unreachable for candidates; this is defense in depth, not an independently observable candidate guard. |
+| **2.** Consent check disabled (`server.ts`) | Red: `logs nothing and queues nothing before consent`: `expected 200 to be 403` at `interview.test.ts:226` |
+| **3.** Candidate role ceiling widened to editor/viewer (`lobby.ts`) | Red: `refuses to admit a candidate token as an editor`: `expected 200 to be 403` at `interview.test.ts:323` |
+
+| File / run | SHA-256 before | SHA-256 mutated | SHA-256 restored |
+| --- | --- | --- | --- |
+| `terminalService.ts` 1a | `117e9db97840ad2845922fbd2e9b21e2579f840044f433f944aa2addee625e5b` | `9bd5a371c3c82ffa1dd49e678e72a53826adbe62226b3642aedaae7ca79bc386` | `117e9db97840ad2845922fbd2e9b21e2579f840044f433f944aa2addee625e5b` |
+| `terminalService.ts` 1b | `117e9db97840ad2845922fbd2e9b21e2579f840044f433f944aa2addee625e5b` | `9f650ad9047432983dc94fde14e2af21c77d84113607f9482652200fe75b41f8` | `117e9db97840ad2845922fbd2e9b21e2579f840044f433f944aa2addee625e5b` |
+| `server.ts` 2 | `bdc11ad9c5eb28343c34de49ac12cfa24de31fe0fb471fb8240bf61556e70d75` | `c67abc14c8ef01d0dbcc895d54443877f06260161ac031e3a6d114780f884458` | `bdc11ad9c5eb28343c34de49ac12cfa24de31fe0fb471fb8240bf61556e70d75` |
+| `lobby.ts` 3 | `53d0c9d05805901efaca0af7773e72126648a04d6e1355641f38ba494cd6b60c` | `86a4a8b17ca173a4b111e37d00a15dead0c5d9141ba51447e0a314db4ee86ffc` | `53d0c9d05805901efaca0af7773e72126648a04d6e1355641f38ba494cd6b60c` |
+
+For completeness, applying **1a + 1b together** (the earlier GO 2 mutation) reached the host
+PTY and failed with `PTY spawn failed: Error: the host PTY must never be a fallback for a
+candidate` and `expected 4500 to be 4403`. The separate runs above show why: either guard
+alone keeps the candidate off the host path; both must be removed for the fallback.
+
+**Non-candidate terminal confirmation.** The committed browser run still opened the
+normal terminal control and executed `node --version` in a real host PTY (`v22.21.1`), while
+the candidate tests assert zero host spawns when the sandbox is unavailable. The host
+terminal path was not modified by the candidate branch.
 
 ### Build and static checks
 
@@ -377,7 +450,7 @@ and status-bar touch-target fixes shipped the same day.
 ```bash
 npm install
 npm run typecheck      # 0
-npm test               # 215 passing
+npm test               # 226 passing
 npm run build          # 0
 
 # Terminal 1 — built Host daemon
@@ -467,10 +540,12 @@ anyone with the token can do anything the host user can (§5 "Security posture")
 
 ### 8.3 Rooms like Google Meet
 
-**Current state (0.6.0):** the daemon has a default room plus admin-created
-rooms, each with its own tokens, lobby, invites, root and signalling hub. Moderation
-supports ask-to-mute, spotlight, hand raise and remove-from-call; call removal leaves the
-editor and terminal connected. There is no room-management UI, chat or host transfer yet.
+**Current state (0.7.0):** the daemon has a default room plus admin-created rooms, each
+with its own tokens, lobby, invites, root and signalling hub. Interview rooms add a
+consent-gated candidate seat, bounded integrity data and a Docker-only candidate terminal.
+Moderation supports ask-to-mute, spotlight, hand raise and remove-from-call; call removal
+leaves the editor and terminal connected. There is still no room-management UI, chat or
+host transfer yet.
 
 **Plan:**
 
@@ -705,3 +780,69 @@ fallback) — that decision decides how much of §8.2 lands in phase 1 vs phase 
   room and moderation state are in memory. No new dependencies. PathGuard, FileService
   policy internals, Yjs internals, WebRTC media negotiation, 0.4.0 lobby semantics and the
   0.3.x admin-listener guards were not changed.
+
+### 0.7.0 — interview profile, integrity signals, sandboxed terminal (2026-11-12)
+
+* **Additive candidate seat.** `candidate` is a fourth guest role with exactly
+  `fs.read`, `fs.write`, `call.join`; it has no `fs.delete` and no `term.use`. An interview
+  room is created through `POST /admin/api/rooms` with `profile: "interview"` and an
+  optional `candidateDir` (default `solution`). Creation seeds the directory and installs
+  room policy rules: `solution` and `solution/**` are `rw`, everything else is `r` for
+  every role in that room. Creation also realpaths the candidate directory and refuses a
+  symlink that resolves outside the room, since Docker resolves the bind-mount source on
+  the Host. Candidate invites and candidate token rotation are supported,
+  and the lobby ceiling only allows a candidate token to be admitted as `candidate`.
+* **Consent before admission.** `POST /api/lobby/join` requires `{ "consent": true }` for a
+  candidate; otherwise `403 CONSENT_REQUIRED`. The client renders the server's manifest on
+  a dedicated screen and sends nothing until acceptance. Declining is a neutral dead end
+  with no request, event, snapshot or replay data. The copy says signals are logged "for
+  the interviewer to review"; it does not claim detection or proof of cheating.
+* **Bounded integrity data.** Candidate document updates are recorded by path, connection
+  id and typed/paste-sized character count; snapshots are content-bearing and capped at 256
+  files and 4 MB total. The event ring holds 2,000 entries and the replay payload exposes
+  truncation flags. `POST /api/integrity` is authenticated, candidate-only and
+  consent-gated, accepts at most 100 events per batch, and returns 202 with the accepted
+  count. `GET /admin/api/rooms/:roomId/replay` is admin-only. This iteration is data-only:
+  there is no scrubber UI.
+* **Client signals.** After admission the candidate client reports visibility changes,
+  window blur/focus, fullscreen enter/exit, paste size and active path, and the browser's
+  `displaySurface` when screen sharing starts. Paste content, editor text and pixels are
+  never sent. The signals are batched and best-effort; a modified client can stop sending
+  them, so they are review evidence, not tamper-proof detection.
+* **Docker-only candidate terminal.** The candidate terminal branch runs before the normal
+  host `term.use` path. With `--interview-sandbox`, startup probes `docker version` and
+  `docker image inspect`; it never pulls, builds or installs. The container invocation is
+  `--rm --interactive --tty --network none --cpus 1 --memory 512m --pids-limit 128
+  --cap-drop ALL --security-opt no-new-privileges --user 1000:1000 --workdir /workspace`
+  with the project root mounted `:ro` at `/workspace`, a `/tmp` tmpfs, `HOME=/tmp` and
+  only `<root>/solution` mounted `:rw`. If the probe fails, the candidate socket closes
+  with `4403` and a sandbox-specific reason; the host spawn counter stays at zero and the
+  sandbox spawn counter stays at zero. Non-candidate terminal behavior is unchanged.
+* **Client and Host UI.** `ConsentScreen` gates the app before `joinLobby`; the candidate
+  editor disables Monaco suggestions from `monacoSuggestions: false`; terminal
+  availability comes from `sandboxTerminalAvailable`, not `term.use`; the Host pending card
+  offers `Admit candidate`, and the invite role includes `candidate` when that room has a
+  candidate token. The candidate terminal's unavailable control is disabled with a
+  sandbox-specific tooltip rather than a read-only message.
+* **Version/docs.** Root, server and client manifests are 0.7.0; `SERVER_VERSION`, `--version`
+  and the token gate label are 0.7.0. `README.md` and `AGENT.md` document the interview
+  profile, consent gate, signal scope, Docker flags and the fail-closed terminal.
+* **Verified.** 226/226 server tests in 16 files; both typechecks 0; production build 0;
+  `git diff --check` 0; 28/28 committed real-Chrome checks, including the non-candidate
+  host terminal; 13/13 temporary interview-browser checks covering decline, no-queue
+  before consent, accept, candidate admission, manifest/capabilities, unavailable-sandbox
+  terminal and no console errors. The four mutation runs above were completed and restored
+  byte-identically: 1a, 2 and 3 went red; 1b alone was inert because the candidate branch
+  remains the effective guard, while 1a + 1b together reached the host PTY. No new server
+  dependencies. The approved route snapshots were the only
+  existing-test changes.
+* **Limitations.** The Docker-available path is unit-tested with an injected spawn seam and
+  exact argv assertions; no real container was launched (the image is not pulled
+  automatically, and the test environment was not assumed to have it). There is no replay
+  scrubber UI. Integrity signals are client-reported and not tamper-proof. The Host console
+  UI still drives the default room; an interview room must be created through the admin
+  API, and the candidate-role invite option appears only when that room has a candidate
+  token. The temporary interview browser pass is not committed to `e2e/browser.mjs`.
+  No real tunnel, WebRTC media, screen-share capture, PathGuard internals, FileService
+  policy internals, Yjs sync internals, signalling payloads, room isolation semantics or
+  lobby/kick/lock algorithms were changed.

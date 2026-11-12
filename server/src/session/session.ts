@@ -7,7 +7,9 @@ import { Lobby } from '../lobby/lobby.js';
 import { AccessPolicy, type Rule } from '../security/accessPolicy.js';
 import { PathGuard } from '../security/pathGuard.js';
 import type { Principal } from '../security/principal.js';
-import { TerminalService } from '../terminal/terminalService.js';
+import { TerminalService, type TerminalSpawn } from '../terminal/terminalService.js';
+import { InterviewStore } from '../interview/interviewStore.js';
+import type { InterviewSandboxStatus } from '../terminal/interviewSandbox.js';
 
 /**
  * One project root and everything bound to it. Switching roots builds a new
@@ -29,6 +31,8 @@ export interface Session {
   readonly lobby: Lobby;
   /** Invite links for this root; a root switch builds a fresh, empty set. */
   readonly invites: InviteStore;
+  /** GO 1 stub: consent, integrity events and replay data for this session. */
+  readonly interview: InterviewStore;
   /** The single file-access choke point for one principal. */
   access(principal: Principal): AccessFileService;
 }
@@ -53,6 +57,15 @@ export interface SessionOptions {
   inviteTokens?: InviteTokenSource;
   /** Injectable clock for invite expiry/rate tests. */
   inviteNow?: () => number;
+  /** Interview room profile and its writable subdirectory. */
+  interviewProfile?: 'interview';
+  candidateDir?: string;
+  interviewRoomId?: string;
+  /** GO 1 stub: startup sandbox probe result. */
+  interviewSandbox?: InterviewSandboxStatus;
+  /** Test seams for the terminal paths. */
+  terminalSpawn?: TerminalSpawn;
+  sandboxSpawn?: TerminalSpawn;
 }
 
 /** Construct a session from a directory that already exists. */
@@ -64,8 +77,30 @@ export function createSession(root: string, options: SessionOptions): Session {
   });
   const policy = new AccessPolicy();
   policy.setRules(options.hostRules ?? [], options.confirmUnhide === true);
-  const documents = new DocumentHub(files, { saveDebounceMs: options.saveDebounceMs, policy });
-  const terminals = new TerminalService(pathGuard, { enabled: options.terminalEnabled });
+  const interview = new InterviewStore({ roomId: options.interviewRoomId });
+  const documents = new DocumentHub(files, {
+    saveDebounceMs: options.saveDebounceMs,
+    policy,
+    onUpdate: (event) => {
+      if (event.origin !== 'candidate' || !event.connectionId) return;
+      if (!interview.hasConsent(event.connectionId)) return;
+      interview.noteUpdate({
+        connectionId: event.connectionId,
+        path: event.path,
+        chars: event.chars,
+        insertedChars: event.insertedChars,
+        origin: 'candidate',
+      });
+      if (event.content !== undefined) interview.captureSnapshot(event.path, event.content);
+    },
+  });
+  const terminals = new TerminalService(pathGuard, {
+    enabled: options.terminalEnabled,
+    sandbox: options.interviewSandbox,
+    sandboxCandidateDir: options.candidateDir ?? 'solution',
+    spawn: options.terminalSpawn,
+    sandboxSpawn: options.sandboxSpawn,
+  });
   const lobby = new Lobby({
     enabled: options.lobby?.enabled ?? true,
     timeoutMs: options.lobby?.timeoutMs ?? 120_000,
@@ -85,6 +120,7 @@ export function createSession(root: string, options: SessionOptions): Session {
     policy,
     lobby,
     invites,
+    interview,
   };
   return { ...session, access: (principal) => AccessFileService.forSession(session, principal) };
 }

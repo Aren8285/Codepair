@@ -245,7 +245,19 @@ export function createAdminApp(options: AdminAppOptions): express.Express {
       if (body.confirmBroad !== undefined && typeof body.confirmBroad !== 'boolean') {
         throw new AppError(400, 'BAD_REQUEST', '"confirmBroad" must be a boolean.');
       }
-      const room = await options.sessions.create({ root, confirmBroad: body.confirmBroad === true });
+      const profile = body.profile;
+      if (profile !== undefined && profile !== 'interview') {
+        throw new AppError(400, 'BAD_REQUEST', '"profile" must be "interview" when provided.');
+      }
+      const candidateDir = body.candidateDir;
+      if (candidateDir !== undefined && (typeof candidateDir !== 'string' || candidateDir.length === 0)) {
+        throw new AppError(400, 'BAD_REQUEST', '"candidateDir" must be a non-empty string when provided.');
+      }
+      const room = await options.sessions.create({
+        root,
+        confirmBroad: body.confirmBroad === true,
+        ...(profile === 'interview' ? { profile: 'interview' as const, candidateDir } : {}),
+      });
       (options.logger ?? console).log(`[codepair] host console: created room ${room.id} at ${room.session.root}`);
       response.status(201).json({
         room: {
@@ -254,11 +266,13 @@ export function createAdminApp(options: AdminAppOptions): express.Express {
           rootPath: room.session.root,
           createdAt: room.createdAt,
           isDefault: room.isDefault,
+          ...(room.profile ? { profile: room.profile, candidateDir: room.candidateDir } : {}),
         },
         tokens: {
           owner: room.tokens.tokenFor('owner'),
           editor: room.tokens.tokenFor('editor'),
           viewer: room.tokens.tokenFor('viewer'),
+          ...(room.tokens.tokenFor('candidate') ? { candidate: room.tokens.tokenFor('candidate') } : {}),
         },
       });
     }),
@@ -276,6 +290,11 @@ export function createAdminApp(options: AdminAppOptions): express.Express {
       response.status(204).end();
     }),
   );
+
+  app.get('/admin/api/rooms/:roomId/replay', requireCap('session.admin'), (request, response) => {
+    const room = roomOrThrow(request.params.roomId);
+    response.json(room.session.interview.replay());
+  });
 
   app.get('/admin/api/rooms/:roomId/state', requireCap('session.admin'), (request, response) => {
     const room = roomOrThrow(request.params.roomId);
@@ -570,8 +589,8 @@ async function applyPolicyRules(session: Session, rawBody: unknown) {
 function admitLobbyEntry(session: Session, id: string | undefined, rawBody: unknown) {
   const body = asRecord(rawBody);
   const role = body.role;
-  if (role !== 'editor' && role !== 'viewer') {
-    throw new AppError(400, 'BAD_REQUEST', '"role" must be "editor" or "viewer".');
+  if (role !== 'editor' && role !== 'viewer' && role !== 'candidate') {
+    throw new AppError(400, 'BAD_REQUEST', '"role" must be "editor", "viewer" or "candidate".');
   }
   if (!id) throw new AppError(400, 'BAD_REQUEST', 'A lobby entry id is required.');
   return session.lobby.admit(id, role);
@@ -594,8 +613,8 @@ function setLobbyLock(session: Session, rawBody: unknown) {
 function createInvite(session: Session, rawBody: unknown) {
   const body = asRecord(rawBody);
   const role = body.role;
-  if (role !== 'editor' && role !== 'viewer') {
-    throw new AppError(400, 'BAD_REQUEST', 'An invite can only grant editor or viewer access; owner is never allowed.');
+  if (role !== 'editor' && role !== 'viewer' && role !== 'candidate') {
+    throw new AppError(400, 'BAD_REQUEST', 'An invite can only grant editor, viewer or candidate access; owner is never allowed.');
   }
   const ttlMinutes = body.ttlMinutes;
   if (ttlMinutes !== undefined && ttlMinutes !== null && typeof ttlMinutes !== 'number') {
@@ -618,13 +637,13 @@ function revokeInvite(session: Session, id: string | undefined) {
 }
 
 function tokenRoles(room: Room) {
-  const roles = ['owner', 'editor', 'viewer'] as const;
+  const roles = ['owner', 'editor', 'viewer', 'candidate'] as const;
   return roles.map((role) => ({ role, configured: room.tokens.tokenFor(role) !== undefined }));
 }
 
 function rotateToken(room: Room, role: string | undefined) {
-  if (role !== 'owner' && role !== 'editor' && role !== 'viewer') {
-    throw new AppError(400, 'BAD_REQUEST', '"role" must be owner, editor or viewer.');
+  if (role !== 'owner' && role !== 'editor' && role !== 'viewer' && role !== 'candidate') {
+    throw new AppError(400, 'BAD_REQUEST', '"role" must be owner, editor, viewer or candidate.');
   }
   const token = room.tokens.rotate(role);
   if (!token) {

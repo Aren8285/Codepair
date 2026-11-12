@@ -11,7 +11,7 @@ export interface HostSessionState {
 
 export interface HostInvite {
   id: string;
-  role: 'editor' | 'viewer';
+  role: 'editor' | 'viewer' | 'candidate';
   createdAt: number;
   expiresAt: number | null;
   maxUses: number | null;
@@ -20,7 +20,7 @@ export interface HostInvite {
 }
 
 export interface HostTokenRole {
-  role: 'owner' | 'editor' | 'viewer';
+  role: 'owner' | 'editor' | 'viewer' | 'candidate';
   configured: boolean;
 }
 
@@ -60,7 +60,7 @@ export class HostApi {
     return this.request<HostSessionState>('/admin/api/state');
   }
 
-  admit(id: string, role: 'editor' | 'viewer'): Promise<unknown> {
+  admit(id: string, role: 'editor' | 'viewer' | 'candidate'): Promise<unknown> {
     return this.request(`/admin/api/lobby/${encodeURIComponent(id)}/admit`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -90,7 +90,7 @@ export class HostApi {
     return this.request('/admin/api/invites');
   }
 
-  createInvite(input: { role: 'editor' | 'viewer'; ttlMinutes: number | null; maxUses: number | null }): Promise<{
+  createInvite(input: { role: 'editor' | 'viewer' | 'candidate'; ttlMinutes: number | null; maxUses: number | null }): Promise<{
     invite: HostInvite;
   }> {
     return this.request('/admin/api/invites', {
@@ -108,7 +108,7 @@ export class HostApi {
     return this.request('/admin/api/tokens');
   }
 
-  rotateToken(role: 'owner' | 'editor' | 'viewer'): Promise<{ role: string; token: string }> {
+  rotateToken(role: 'owner' | 'editor' | 'viewer' | 'candidate'): Promise<{ role: string; token: string }> {
     return this.request(`/admin/api/tokens/${role}/rotate`, { method: 'POST' });
   }
 

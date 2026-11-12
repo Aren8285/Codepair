@@ -6,7 +6,7 @@ import { AppError } from '../errors.js';
  * grant owner access. The token itself is looked up at redeem time, so an
  * invite never stores a token value.
  */
-export type InviteRole = 'editor' | 'viewer';
+export type InviteRole = 'editor' | 'viewer' | 'candidate';
 
 export interface Invite {
   /** Random, URL-safe; at least 128 bits of entropy. */
@@ -99,8 +99,8 @@ export class InviteStore {
 
   create(input: { role: InviteRole | string; ttlMinutes?: number | null; maxUses?: number | null }): Invite {
     const role = input.role;
-    if (role !== 'editor' && role !== 'viewer') {
-      throw new AppError(400, 'BAD_REQUEST', 'An invite can only grant editor or viewer access; owner is never allowed.');
+    if (role !== 'editor' && role !== 'viewer' && role !== 'candidate') {
+      throw new AppError(400, 'BAD_REQUEST', 'An invite can only grant editor, viewer or candidate access; owner is never allowed.');
     }
 
     const ttl = input.ttlMinutes;

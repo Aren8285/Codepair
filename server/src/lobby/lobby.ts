@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { AppError } from '../errors.js';
 
 /** A seat is what the Host grants; it can never exceed the token's own role. */
-export type SeatRole = 'editor' | 'viewer';
+export type SeatRole = 'editor' | 'viewer' | 'candidate';
 export type LobbyRole = SeatRole | 'owner';
 export type PendingState = 'waiting' | 'admitted' | 'denied' | 'expired' | 'withdrawn';
 /** A connection that left the queue keeps a terminal state it can be refused with. */
@@ -179,10 +179,12 @@ export class Lobby {
     if (!entry || entry.state !== 'waiting') {
       throw new AppError(409, 'LOBBY_CLOSED', 'That request is no longer waiting.');
     }
-    // The seat is a ceiling, never an upgrade: a viewer token cannot be let in
-    // as an editor, whatever the Host asks for.
-    if (role === 'editor' && entry.tokenRole === 'viewer') {
-      throw new AppError(403, 'ROLE_CEILING', 'That connection cannot be admitted as an editor.');
+    // The seat is a ceiling, never an upgrade. Candidate tokens are strictly
+    // candidate-only; viewer tokens cannot become editors, and editor tokens
+    // cannot become candidates.
+    const allowed = allowedSeats(entry.tokenRole);
+    if (!allowed.includes(role)) {
+      throw new AppError(403, 'ROLE_CEILING', `That connection cannot be admitted as a ${role}.`);
     }
 
     entry.state = 'admitted';
@@ -325,8 +327,21 @@ export class Lobby {
       locked: false,
       state: 'admitted',
       displayName: sanitizeDisplayName(displayName),
-      seat: tokenRole === 'viewer' ? 'viewer' : 'editor',
+      seat: tokenRole === 'candidate' ? 'candidate' : tokenRole === 'viewer' ? 'viewer' : 'editor',
     };
+  }
+}
+
+function allowedSeats(role: LobbyRole): SeatRole[] {
+  switch (role) {
+    case 'owner':
+      return ['editor', 'viewer', 'candidate'];
+    case 'editor':
+      return ['editor', 'viewer'];
+    case 'viewer':
+      return ['viewer'];
+    case 'candidate':
+      return ['candidate'];
   }
 }
 

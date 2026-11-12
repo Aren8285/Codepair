@@ -47,7 +47,9 @@ Host machine                                    Remote clients
 | `server/src/tunnelStatus.ts` | Tunnel status snapshot and provider-CLI detection; no downloads or subprocesses |
 | `server/src/admin/adminApp.ts` | Loopback Host console: `/host` page, default + room-scoped routes, SSE, lobby/kick, state, folder list, root switch, policy, invites, token rotation, moderator grants, tunnel status |
 | `server/src/documents/documentHub.ts` | One Yjs doc per file, sync protocol, presence, debounced persistence |
-| `server/src/terminal/terminalService.ts` | PTY sessions, input/resize handling, shutdown |
+| `server/src/terminal/terminalService.ts` | PTY sessions, input/resize handling, shutdown; candidate branch is sandbox-only |
+| `server/src/terminal/interviewSandbox.ts` | Injectable Docker probe, fixed sandbox invocation and candidate-folder normalization |
+| `server/src/interview/interviewStore.ts` | Candidate consent map, bounded integrity event ring and replay payload |
 | `server/src/terminal/shellEnv.ts` | Minimal scrubbed environment + generated rc files |
 | `server/src/signaling/signalingHub.ts` | Room-scoped offer/answer/candidate relay plus live-socket moderator grants, mute requests, spotlight, hand raise and call-only removal |
 | `server/src/tunnel.ts` | `cloudflared` / `ngrok` child process, URL discovery, teardown |
@@ -55,10 +57,12 @@ Host machine                                    Remote clients
 | `client/src/lib/docProvider.ts` | Authenticated Yjs provider (sync + awareness + save) |
 | `client/src/lib/connection.ts` | Per-tab connection id (`sessionStorage`) and rotation |
 | `client/src/components/LobbyScreen.tsx` | Waiting / denied / expired / removed / locked / full screens |
+| `client/src/components/ConsentScreen.tsx` | Candidate consent gate before any lobby request; neutral decline path |
+| `client/src/lib/integrity.ts` | Candidate client-reported integrity batches; no content or pixels |
 | `client/src/host/*`, `client/host.html` | Host console UI: separate Vite entry, responsive page-level control room served only by the admin listener |
 | `client/src/lib/calls.ts` | Peer mesh, media state, screen share, moderation actions and "muted by host" handling |
 | `client/src/components/*` | IDE chrome: TopBar, FileTree, EditorPane, TerminalPanel, CallDock, dialogs |
-| `server/test/*` | 215 Vitest tests: sandboxing, policy, API, admin, capabilities, lobby, invites, rooms, doc sync, terminal, signalling |
+| `server/test/*` | 226 Vitest tests: sandboxing, policy, API, admin, capabilities, lobby, invites, rooms, doc sync, terminal, signalling and interview safety |
 | `REPORT.md` | Final implementation report: verified features, tests, limitations, remaining work |
 | `e2e/browser.mjs` | Two-client headless-Chrome test of the real UI |
 
@@ -98,6 +102,8 @@ never travels in query strings, Referer headers or access logs.
 | `--no-lobby` | lobby on | Admit every authenticated guest immediately; lobby actions return `409 LOBBY_DISABLED` |
 | `--lobby-timeout <seconds>` | `120` | Pending request lifetime, 1–3600 |
 | `--no-terminal` | terminal on | Explicit Host opt-out of remote shells |
+| `--interview-sandbox` | off | Docker-only candidate terminal; no host fallback |
+| `--interview-sandbox-image` | `node:22-bookworm-slim` | Inspected locally, never pulled |
 | `--rule <glob>=<hidden\|r\|rw>` | — | Path rule, repeatable up to 50, validated at startup |
 | `--confirm-unhide` | off | Required when a `--rule` lifts a built-in secret default |
 | `--tunnel <provider>` | off | `cloudflare` or `ngrok` |
@@ -110,7 +116,7 @@ Environment equivalents: `CODE_PAIR_MODE`, `CODE_PAIR_TOKEN`, `CODE_PAIR_PORT`, 
 `CODE_PAIR_HOST`, `CODE_PAIR_ALLOW_ORIGINS`, `CODE_PAIR_DEV_CLIENT`,
 `CODE_PAIR_TERMINAL=off`, `CODE_PAIR_TUNNEL`, `CODE_PAIR_ICE_SERVERS`,
 `CODE_PAIR_MAX_FILE_BYTES`, `CODE_PAIR_SAVE_DEBOUNCE_MS`, `CODE_PAIR_IGNORE`,
-`CODE_PAIR_CLIENT_DIST`.
+`CODE_PAIR_INTERVIEW_SANDBOX_IMAGE`, `CODE_PAIR_CLIENT_DIST`.
 
 ## Authentication model
 
@@ -130,8 +136,9 @@ Environment equivalents: `CODE_PAIR_MODE`, `CODE_PAIR_TOKEN`, `CODE_PAIR_PORT`, 
   is `403 ROOM_MISMATCH` in another.
 * `read-only` mode is enforced on the server (`requireWrite`, terminal handshake
   rejection, read-only doc connections refuse Yjs updates) — not by hiding buttons.
-* **Roles vs. the admin listener.** Guest roles are `owner`, `editor` and `viewer`; since
-  0.3.2 the owner no longer carries `session.admin`. The admin listener's single grant is
+* **Roles vs. the admin listener.** Guest roles are `owner`, `editor`, `viewer` and the
+  additive `candidate` role (interview rooms only); since 0.3.2 the owner no longer carries
+  `session.admin`. The admin listener's single grant is
   the `host` role (`session.admin` only), so a guest token can never administer the
   session and the admin token can never read a file.
 * **Host console:** a second `http.Server` on `127.0.0.1:<admin-port>`, with a fresh token
@@ -145,7 +152,7 @@ Environment equivalents: `CODE_PAIR_MODE`, `CODE_PAIR_TOKEN`, `CODE_PAIR_PORT`, 
   API route: it exchanges a 144-bit invite id for the role's current token, then the guest
   still enters the lobby. Invites expire, have a use cap, and share one byte-identical
   `404 INVITE_INVALID` for unknown/expired/exhausted/revoked. The Host console can rotate
-  `owner`, `editor` or `viewer`; the old token fails new HTTP and WebSocket connections,
+  `owner`, `editor`, `viewer` or `candidate`; the old token fails new HTTP and WebSocket connections,
   that role's live invites are revoked, and existing sockets stay connected.
 
 ## Join lobby
@@ -159,9 +166,11 @@ One `Lobby` per room (`server/src/lobby/lobby.ts`), reset by that room's `switch
 * **Realtime.** The doc, terminal and signal upgrades check the seat before upgrading. A
   refusal completes the upgrade and closes with `4425` and a reason; kick closes live
   sockets with `4429`.
-* **Seat ceiling.** The Host grants `editor` or `viewer`; effective capabilities are
-  `seatPrincipal(token, seat)`, an intersection. A viewer token cannot be admitted as an
-  editor (`403 ROLE_CEILING`); an editor admitted as viewer keeps `fs.read` but loses writes.
+* **Seat ceiling.** The Host grants `editor`, `viewer` or (for an interview room)
+  `candidate`; effective capabilities are `seatPrincipal(token, seat)`, an intersection. A
+  viewer token cannot be admitted as an editor and a candidate token can only be seated as
+  candidate (`403 ROLE_CEILING`); an editor admitted as viewer keeps `fs.read` but loses
+  writes.
 * **States.** `waiting` expires after `--lobby-timeout` (default 120 s) and may retry;
   `denied` and `removed` are terminal per connection id; `locked` refuses new joins but
   leaves admitted tabs alone. The 51st pending request is refused (`429 LOBBY_FULL`).
@@ -178,7 +187,7 @@ with no invites. An invite holds only `{ id, role, expiresAt, maxUses, usedCount
 a token value. The token is looked up when the link is redeemed, and the new token still
 has to pass the lobby.
 
-* **Minting.** `POST /admin/api/invites` accepts `editor`/`viewer`, an optional TTL
+* **Minting.** `POST /admin/api/invites` accepts `editor`/`viewer`/`candidate`, an optional TTL
   (1–10080 minutes) and an optional use cap (1–1000). Owner cannot be invited, and a role
   with no configured token is refused (`409 ROLE_NOT_CONFIGURED`). At most 50 live invites
   exist at once (`429 INVITE_LIMIT`).
@@ -266,7 +275,7 @@ optional decider. It can add refusals on top of `PathGuard`, never remove one.
 | `GET /admin/api/policy` | `rules`, `defaults`, `confirmUnhide`, `terminalBypassesRules` |
 | `PUT /admin/api/policy/rules` | `{ rules, confirmUnhide? }` → validate, flush, apply, echo `rules`/`confirmUnhide`/`affected` |
 | `GET /admin/api/lobby` | `enabled`, `locked`, `pending`, `admitted` snapshot |
-| `POST /admin/api/lobby/:id/admit` | `{ role: "editor" \| "viewer" }` |
+| `POST /admin/api/lobby/:id/admit` | `{ role: "editor" \| "viewer" \| "candidate" }` |
 | `POST /admin/api/lobby/:id/deny` | terminal refusal for that connection |
 | `POST /admin/api/lobby/lock` | `{ locked: boolean }` |
 | `POST /admin/api/connections/:connectionId/kick` | close doc/terminal/signal with `4429`, mark removed |

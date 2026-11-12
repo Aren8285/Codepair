@@ -431,6 +431,12 @@ body {
   color: var(--accent-strong);
 }
 
+.host__badge--candidate {
+  color: var(--accent-strong, #b9b3ff);
+  border-color: rgba(124, 140, 248, 0.35);
+  background: rgba(124, 140, 248, 0.12);
+}
+
 .host__badge--viewer {
   background: rgba(118, 199, 232, 0.12);
   color: #8fd4ee;

@@ -1,5 +1,9 @@
+import fsp from 'node:fs/promises';
+import path from 'node:path';
 import { AppError } from '../errors.js';
 import { generateAccessToken, TokenStore } from '../security/auth.js';
+import { normalizeCandidateDir } from '../terminal/interviewSandbox.js';
+import type { Rule } from '../security/accessPolicy.js';
 import { SWITCH_CLOSE_CODE, SWITCH_CLOSE_REASON, type SwitchOptions, type SwitchResult } from '../session/sessionManager.js';
 import { createSession, type Session, type SessionOptions } from '../session/session.js';
 import { assertSwitchable } from '../session/hostPaths.js';
@@ -22,6 +26,9 @@ export interface Room {
   readonly signaling: SignalingHub;
   readonly moderators: Set<string>;
   readonly isDefault: boolean;
+  /** GO 1 stub: the interview policy/seed is implemented in GO 2. */
+  readonly profile?: 'interview';
+  readonly candidateDir?: string;
 }
 
 interface MutableRoom {
@@ -32,11 +39,15 @@ interface MutableRoom {
   readonly signaling: SignalingHub;
   readonly moderators: Set<string>;
   readonly isDefault: boolean;
+  readonly profile?: 'interview';
+  readonly candidateDir?: string;
 }
 
 export interface CreateRoomOptions {
   root: string;
   confirmBroad?: boolean;
+  profile?: 'interview';
+  candidateDir?: string;
 }
 
 export interface RoomDisposeResult {
@@ -125,9 +136,47 @@ export class RoomRegistry {
       let id = generateRoomId();
       while (id === this.defaultRoom.id || this.rooms.has(id)) id = generateRoomId();
 
-      const tokens = this.freshTokens();
-      const session = createSession(canonical, this.optionsFor(id, tokens, false));
-      const room = this.makeRoom(id, session, tokens, false);
+      const profile = options.profile;
+      let candidateDir: string | undefined;
+      if (profile === 'interview') {
+        try {
+          candidateDir = normalizeCandidateDir(options.candidateDir ?? 'solution');
+        } catch {
+          throw new AppError(400, 'INVALID_CANDIDATE_DIR', 'candidateDir must be a relative directory inside the project.');
+        }
+        const solution = path.resolve(canonical, candidateDir);
+        if (solution !== canonical && !solution.startsWith(`${canonical}${path.sep}`)) {
+          throw new AppError(400, 'INVALID_CANDIDATE_DIR', 'candidateDir must stay inside the project.');
+        }
+        // Seed the one writable folder. This is a directory only; task files
+        // remain whatever the Host put in the root.
+        try {
+          await fsp.mkdir(solution, { recursive: true });
+          // Docker bind mounts resolve a symlinked source on the Host. Reject a
+          // candidate directory whose real path escaped the room root, otherwise
+          // the `solution:rw` mount could expose a Host directory outside it.
+          const realSolution = await fsp.realpath(solution);
+          if (realSolution !== canonical && !realSolution.startsWith(`${canonical}${path.sep}`)) {
+            throw new AppError(400, 'INVALID_CANDIDATE_DIR', 'candidateDir must stay inside the project.');
+          }
+        } catch (error) {
+          if (error instanceof AppError) throw error;
+          throw new AppError(409, 'CANDIDATE_DIR_UNAVAILABLE', 'The candidate directory could not be created.');
+        }
+      }
+      const tokens = this.freshTokens(profile === 'interview');
+      const session = createSession(
+        canonical,
+        this.optionsFor(
+          id,
+          tokens,
+          false,
+          profile,
+          candidateDir,
+          profile === 'interview' && candidateDir ? interviewRules(candidateDir) : undefined,
+        ),
+      );
+      const room = this.makeRoom(id, session, tokens, false, profile, candidateDir);
       this.rooms.set(id, room);
       return room;
     });
@@ -154,6 +203,7 @@ export class RoomRegistry {
       room.session.terminals.dispose({ closeCode: ROOM_CLOSE_CODE, reason: ROOM_CLOSE_REASON });
       room.signaling.dispose({ code: ROOM_CLOSE_CODE, reason: ROOM_CLOSE_REASON });
       room.session.lobby.dispose();
+      room.session.interview.dispose();
       return { flushErrors };
     });
   }
@@ -169,6 +219,7 @@ export class RoomRegistry {
         room.session.terminals.dispose();
         room.signaling.dispose();
         room.session.lobby.dispose();
+        room.session.interview.dispose();
       }),
     );
     this.rooms.clear();
@@ -185,7 +236,17 @@ export class RoomRegistry {
     }
     this.assertRootAvailable(canonical, room.id);
 
-    const next = createSession(canonical, this.optionsFor(room.id, room.tokens, false));
+    const next = createSession(
+      canonical,
+      this.optionsFor(
+        room.id,
+        room.tokens,
+        false,
+        room.profile,
+        room.candidateDir,
+        room.profile === 'interview' && room.candidateDir ? interviewRules(room.candidateDir) : undefined,
+      ),
+    );
     const previous = room.session;
     room.session = next;
 
@@ -195,15 +256,26 @@ export class RoomRegistry {
     });
     previous.terminals.dispose({ closeCode: SWITCH_CLOSE_CODE, reason: SWITCH_CLOSE_REASON });
     previous.lobby.dispose();
+    previous.interview.dispose();
 
     return { changed: true, session: next, flushErrors };
   }
 
-  private optionsFor(roomId: string, tokens: TokenStore, initial: boolean): SessionOptions {
+  private optionsFor(
+    roomId: string,
+    tokens: TokenStore,
+    initial: boolean,
+    profile?: 'interview',
+    candidateDir?: string,
+    interviewRules?: readonly Rule[],
+  ): SessionOptions {
+    const interview = profile === 'interview';
     return {
       ...this.baseOptions,
-      hostRules: initial ? this.baseOptions.hostRules : [],
-      confirmUnhide: initial ? this.baseOptions.confirmUnhide : false,
+      hostRules: interview ? interviewRules ?? [] : initial ? this.baseOptions.hostRules : [],
+      confirmUnhide: interview ? false : initial ? this.baseOptions.confirmUnhide : false,
+      interviewRoomId: roomId,
+      ...(interview ? { interviewProfile: 'interview' as const, candidateDir } : {}),
       inviteTokens: tokens,
       lobby: {
         enabled: this.baseOptions.lobby?.enabled ?? true,
@@ -213,7 +285,14 @@ export class RoomRegistry {
     };
   }
 
-  private makeRoom(id: string, session: Session, tokens: TokenStore, isDefault: boolean): MutableRoom {
+  private makeRoom(
+    id: string,
+    session: Session,
+    tokens: TokenStore,
+    isDefault: boolean,
+    profile?: 'interview',
+    candidateDir?: string,
+  ): MutableRoom {
     const moderators = new Set<string>();
     const signaling = new SignalingHub({ room: id, moderators });
     return {
@@ -224,17 +303,20 @@ export class RoomRegistry {
       signaling,
       moderators,
       isDefault,
+      ...(profile ? { profile } : {}),
+      ...(candidateDir ? { candidateDir } : {}),
     };
   }
 
-  private freshTokens(): TokenStore {
+  private freshTokens(interview = false): TokenStore {
     const values = new Set<string>();
-    while (values.size < 3) values.add(generateAccessToken());
-    const [owner, editor, viewer] = [...values];
+    while (values.size < (interview ? 4 : 3)) values.add(generateAccessToken());
+    const [owner, editor, viewer, candidate] = [...values];
     return new TokenStore([
       { token: owner!, role: 'owner' },
       { token: editor!, role: 'editor' },
       { token: viewer!, role: 'viewer' },
+      ...(interview ? [{ token: candidate!, role: 'candidate' as const }] : []),
     ]);
   }
 
@@ -259,4 +341,13 @@ export class RoomRegistry {
     );
     return next;
   }
+}
+
+/** One room-wide policy using the existing rule mechanism. */
+function interviewRules(candidateDir: string): Rule[] {
+  return [
+    { pattern: candidateDir, access: 'rw' },
+    { pattern: `${candidateDir}/**`, access: 'rw' },
+    { pattern: '**', access: 'r' },
+  ];
 }

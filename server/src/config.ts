@@ -40,6 +40,10 @@ export interface ServerConfig {
   saveDebounceMs: number;
   maxFileBytes: number;
   terminalEnabled: boolean;
+  /** GO 1 stub: candidate interview terminal sandbox opt-in. */
+  interviewSandbox: boolean;
+  /** Docker image used by the candidate interview sandbox. */
+  interviewSandboxImage: string;
   /** Host path rules given at startup with `--rule`, already parsed. */
   rules: Rule[];
   /** The Host confirmed lifting a built-in secret default (`--confirm-unhide`). */
@@ -193,6 +197,11 @@ export function parseConfig(
     saveDebounceMs: Number(env.CODE_PAIR_SAVE_DEBOUNCE_MS ?? 300),
     maxFileBytes: Number(env.CODE_PAIR_MAX_FILE_BYTES ?? 5 * 1024 * 1024),
     terminalEnabled: !flags['no-terminal'] && env.CODE_PAIR_TERMINAL !== 'off',
+    interviewSandbox: flags['interview-sandbox'] === true,
+    interviewSandboxImage:
+      flagValue(flags, 'interview-sandbox-image') ??
+      env.CODE_PAIR_INTERVIEW_SANDBOX_IMAGE ??
+      'node:22-bookworm-slim',
     rules,
     confirmUnhide,
     lobbyEnabled,

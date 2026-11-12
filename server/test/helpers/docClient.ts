@@ -13,6 +13,8 @@ export interface DocClientOptions {
   wsUrl: string;
   token: string;
   path: string;
+  /** Optional per-tab id; interview replay requires the same id as consent. */
+  connectionId?: string;
 }
 
 export class TestDocClient {
@@ -56,8 +58,10 @@ export class TestDocClient {
   }
 
   async open(): Promise<void> {
+    const query = `?path=${encodeURIComponent(this.options.path)}` +
+      (this.options.connectionId ? `&cid=${encodeURIComponent(this.options.connectionId)}` : '');
     const socket = new WebSocket(
-      `${this.options.wsUrl}?path=${encodeURIComponent(this.options.path)}`,
+      `${this.options.wsUrl}${query}`,
       ['codepair', this.options.token],
     );
     socket.binaryType = 'arraybuffer';

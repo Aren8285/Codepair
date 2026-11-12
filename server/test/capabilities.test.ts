@@ -818,6 +818,7 @@ describe('route audit', () => {
       'GET /api/tree',
       'POST /api/files',
       'POST /api/files/rename',
+      'POST /api/integrity',
       'POST /api/invites/:id/redeem',
       'POST /api/lobby/join',
     ]);

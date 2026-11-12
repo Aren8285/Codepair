@@ -8,6 +8,7 @@ import * as encoding from 'lib0/encoding';
 import { atomicWriteFile, FileService } from '../files/fileService.js';
 import { AppError } from '../errors.js';
 import type { AccessPolicy, AccessView, Rule } from '../security/accessPolicy.js';
+import type { Role } from '../security/principal.js';
 
 export const MESSAGE_SYNC = 0;
 export const MESSAGE_AWARENESS = 1;
@@ -35,6 +36,22 @@ type MetaMessage =
   | { type: 'external'; conflict: boolean; message: string }
   | { type: 'closed'; reason: string };
 
+interface ConnectionMetadata {
+  connectionId?: string;
+  role?: Role;
+}
+
+export interface DocumentUpdateEvent {
+  path: string;
+  connectionId?: string;
+  role?: Role;
+  chars: number;
+  insertedChars: number;
+  origin: 'candidate' | 'external' | 'unknown';
+  /** Present only for candidate updates, for bounded replay snapshots. */
+  content?: string;
+}
+
 class DocConnection {
   alive = true;
   readonly awarenessIds = new Set<number>();
@@ -47,6 +64,7 @@ class DocConnection {
   constructor(
     readonly socket: WebSocket,
     readonly canWrite: boolean,
+    readonly metadata: ConnectionMetadata = {},
   ) {
     this.grantedWrite = canWrite;
   }
@@ -63,6 +81,8 @@ interface HubOptions {
   logger?: Pick<Console, 'error' | 'warn'>;
   /** The session policy, shared with the file choke point. */
   policy: AccessPolicy;
+  /** Optional observer for replay metadata; never changes sync behavior. */
+  onUpdate?: (event: DocumentUpdateEvent) => void;
 }
 
 export class DocumentHub {
@@ -76,6 +96,7 @@ export class DocumentHub {
   private closeCode = 1001;
   private closeReason = 'Server is shutting down.';
   private readonly policy: AccessPolicy;
+  private readonly onUpdate: ((event: DocumentUpdateEvent) => void) | undefined;
   /** Non-undefined only while the rules are being replaced. */
   private gate: FrameGate | undefined;
 
@@ -87,6 +108,7 @@ export class DocumentHub {
     this.idleCloseMs = options.idleCloseMs ?? IDLE_CLOSE_MS;
     this.logger = options.logger ?? console;
     this.policy = options.policy;
+    this.onUpdate = options.onUpdate;
   }
 
   /**
@@ -100,7 +122,13 @@ export class DocumentHub {
   }
 
   /** Attach an upgraded socket to an already prepared document. */
-  connect(relativePath: string, socket: WebSocket, canWrite: boolean, view?: AccessView): void {
+  connect(
+    relativePath: string,
+    socket: WebSocket,
+    canWrite: boolean,
+    view?: AccessView,
+    metadata?: ConnectionMetadata,
+  ): void {
     if (this.disposed) {
       // A connection that resolved this session before the swap must never
       // attach to a hub that is going away.
@@ -114,7 +142,7 @@ export class DocumentHub {
     }
     const allowed =
       canWrite && (view ? view.write(session.relativePath, session.canonicalRelative) : true);
-    session.attach(socket, allowed, view);
+    session.attach(socket, allowed, view, metadata);
   }
 
   /**
@@ -225,6 +253,7 @@ export class DocumentHub {
       maxFileBytes: this.files.maxFileBytes,
       logger: this.logger,
       gate: () => this.gate,
+      onUpdate: this.onUpdate,
       onIdle: (session) => {
         if (this.sessions.get(session.relativePath) === session) {
           this.sessions.delete(session.relativePath);
@@ -253,6 +282,7 @@ interface SessionOptions {
   logger: Pick<Console, 'error' | 'warn'>;
   onIdle: (session: DocSession) => void;
   gate: () => FrameGate | undefined;
+  onUpdate?: (event: DocumentUpdateEvent) => void;
 }
 
 export class DocSession {
@@ -262,6 +292,7 @@ export class DocSession {
   private readonly connections = new Set<DocConnection>();
   private readonly options: SessionOptions;
   private lastPersisted: string;
+  private lastKnownChars: number;
   private diskSignature: DiskSignature | undefined;
   private pollTimer: NodeJS.Timeout | undefined;
   private polling = false;
@@ -286,6 +317,7 @@ export class DocSession {
     this.text = this.doc.getText('content');
     this.awareness = new awarenessProtocol.Awareness(this.doc);
     this.lastPersisted = initialContent;
+    this.lastKnownChars = initialContent.length;
 
     this.doc.transact(() => {
       if (initialContent.length > 0) this.text.insert(0, initialContent);
@@ -377,6 +409,7 @@ export class DocSession {
         if (content.length > 0) this.text.insert(0, content);
       }, EXTERNAL_ORIGIN);
       this.lastPersisted = content;
+      this.lastKnownChars = this.text.length;
       this.diskSignature = signature;
       this.broadcastMeta({
         type: 'external',
@@ -396,13 +429,13 @@ export class DocSession {
     for (const connection of this.connections) this.sendMeta(connection.socket, meta);
   }
 
-  attach(socket: WebSocket, canWrite: boolean, view?: AccessView): void {
+  attach(socket: WebSocket, canWrite: boolean, view?: AccessView, metadata: ConnectionMetadata = {}): void {
     if (this.disposed) {
       socket.close(1001, 'Document closed.');
       return;
     }
     this.cancelIdleClose();
-    const connection = new DocConnection(socket, canWrite);
+    const connection = new DocConnection(socket, canWrite, metadata);
     connection.view = view;
     this.connections.add(connection);
     this.startDiskPoll();
@@ -595,6 +628,21 @@ export class DocSession {
 
   private readonly onDocUpdate = (update: Uint8Array, origin: unknown): void => {
     if (origin === INIT_ORIGIN || this.disposed) return;
+    const chars = this.text.length;
+    const insertedChars = Math.max(0, chars - this.lastKnownChars);
+    this.lastKnownChars = chars;
+    const source = origin instanceof DocConnection ? origin : undefined;
+    const originKind =
+      origin === EXTERNAL_ORIGIN ? 'external' : source?.metadata.role === 'candidate' ? 'candidate' : 'unknown';
+    this.options.onUpdate?.({
+      path: this.relativePath,
+      ...(source?.metadata.connectionId ? { connectionId: source.metadata.connectionId } : {}),
+      ...(source?.metadata.role ? { role: source.metadata.role } : {}),
+      chars,
+      insertedChars,
+      origin: originKind,
+      ...(originKind === 'candidate' ? { content: this.text.toString() } : {}),
+    });
     if (origin === EXTERNAL_ORIGIN) {
       // Content came *from* the disk; remember it as saved and never write it back.
       this.lastPersisted = this.text.toString();
