@@ -1,6 +1,6 @@
 # CodePair — Implementation Report
 
-Version 0.8.0 · macOS arm64 · Node v22.21.1 · npm 10.9.4 · uncommitted review tree (0.7.0 release commit `4e40f7d`)
+Version 0.8.0 · macOS arm64 · Node v22.21.1 · npm 10.9.4 · release commit `7e9a71c` · tag `v0.8.0`
 
 Base report written at 0.2.0; §1 and §3 are kept current, and the addendum at the end
 records each iteration (0.3.x: host console API, host principal, path policy; 0.4.0: join
@@ -346,8 +346,8 @@ and status-bar touch-target fixes shipped the same day.
   HTTPS URL, and tears it down on exit; there is no auto-download or fetched-binary run.
 * **WebRTC media**: voice/video/screen tracks and the peer mesh are implemented
   and the signalling relay is tested, but a real two-device media call was not
-  placed. Cross-NAT calls additionally require TURN, which is not configured
-  here (only Google STUN).
+  placed. v0.8.0 mints TURN credentials when configured, but no live coturn
+  relay was available here to verify cross-NAT media (only Google STUN).
 * **Windows**: the symlink checks and generated shell rc files assume POSIX
   shells. Treat Windows as unverified.
 
@@ -428,7 +428,8 @@ and status-bar touch-target fixes shipped the same day.
 ## 6. Remaining work
 
 1. **Verify a real WebRTC call** between two physical devices on a LAN, and
-   configure TURN for cross-NAT use.
+   verify minted TURN credentials against a live coturn relay for cross-NAT use.
+   TURN minting shipped in 0.8.0; relay evidence is still outstanding.
 2. **Verify a public tunnel** end to end once `cloudflared` or `ngrok` is
    installed and authenticated.
 3. **Conflict resolution UI.** Today a colliding external edit keeps the local
@@ -455,7 +456,7 @@ and status-bar touch-target fixes shipped the same day.
 ```bash
 npm install
 npm run typecheck      # 0
-npm test               # 226 passing
+npm test               # 236 passing
 npm run build          # 0
 
 # Terminal 1 — built Host daemon
@@ -503,16 +504,18 @@ and effectively demands read-only mode because a public URL exposes the token.
    both sides have a rendezvous + STUN/TURN), with the relay as fallback when
    P2P is blocked. Do last — highest complexity, needs congestion/reliability
    tuning.
-4. **TURN for calls.** Cross-NAT calls need TURN (README documents the env
-   var). Operate a `coturn` next to the relay (or use a managed service) and
-   inject it by default whenever the relay is active.
+4. **TURN for calls.** Basic coturn REST credential minting shipped in 0.8.0
+   (README documents the env vars). Remaining: operate a `coturn` next to the
+   relay (or use a managed service), inject it by default when the relay is
+   active, and verify a real relayed call.
 
 **Milestone check:** a remote joins with no port forwarding and valid TLS; the
-token can be rotated live; TURN credentials never reach the client UI.
+token can be rotated live; the raw coturn secret never reaches the client, while
+minted short-lived credentials are returned only by `/api/session`.
 
 ### 8.2 Sandboxed / safeguarded terminal
 
-**Current state (0.7.0):** the ordinary editor/owner terminal is a real `node-pty` shell
+**Current state (0.8.0):** the ordinary editor/owner terminal is a real `node-pty` shell
 as the host user with a scrubbed env and generated rc files. It is deliberately *not* a
 security boundary — anyone with the token can do anything the host user can (§5 "Security
 posture"). The interview candidate terminal is the separate exception: a Docker-only
@@ -549,7 +552,7 @@ it closes with `4403` and never falls back to a host PTY.
 
 ### 8.3 Rooms like Google Meet
 
-**Current state (0.7.0):** the daemon has a default room plus admin-created rooms, each
+**Current state (0.8.0):** the daemon has a default room plus admin-created rooms, each
 with its own tokens, lobby, invites, root and signalling hub. Interview rooms add a
 consent-gated candidate seat, bounded integrity data and a Docker-only candidate terminal.
 Moderation supports ask-to-mute, spotlight, hand raise and remove-from-call; call removal
@@ -566,7 +569,7 @@ host transfer yet.
    client-side), ephemeral emoji reactions (awareness messages), and call chat
    (signalling-relayed, not persisted).
 4. **Media verification:** exercise a real two-device call with fake and physical devices;
-   add TURN where needed.
+   verify the v0.8.0 minted TURN credentials against a real coturn relay.
 5. **Scale path:** keep the mesh to ~6 participants; consider an SFU (or a
    self-hosted one like LiveKit) only when actual user counts demand it.
 
@@ -646,7 +649,7 @@ unchanged.
    of the shipped registry, lobby and moderation.
 4. **§8.5 profiles** — interview mode shipped in 0.7.0; next are the system-sharing kiosk
    and teaching profiles, plus the interview timer/notes/interviewer side-panel UI.
-5. **§8.1 deep track (self-hosted relay, P2P data channels, TURN)** —
+5. **§8.1 deep track (self-hosted relay, P2P data channels; basic TURN shipped in 0.8.0)** —
    continuous work, sized against how much the managed tunnel gets used.
 
 **Open question to settle early:** which sandbox runtime is acceptable on the
@@ -864,7 +867,7 @@ fallback) — that decision decides how much of §8.2 lands in phase 1 vs phase 
   policy internals, Yjs sync internals, signalling payloads, room isolation semantics or
   lobby/kick/lock algorithms were changed.
 
-### 0.8.0 — coturn-compatible TURN credentials (2026-11-14, uncommitted)
+### 0.8.0 — coturn-compatible TURN credentials (2026-11-14)
 
 * **Minting.** `server/src/webrtc/turnCredentials.ts` implements coturn's REST-API
   format: `username = <unixExpiry>:<random label>`, `credential = base64(HMAC-SHA1(
@@ -890,7 +893,9 @@ fallback) — that decision decides how much of §8.2 lands in phase 1 vs phase 
   usernames/credentials do reach authenticated clients by design; no new route was added.
 * **Version/docs.** Root, server and client manifests are 0.8.0; `SERVER_VERSION`,
   `--version` and the token gate label are 0.8.0. `README.md`, `AGENT.md` and the CLI help
-  document the flags, env names and coturn setup. The dependency set is unchanged.
+  document the flags, env names and coturn setup. The dependency set is unchanged. The
+  feature is release commit `7e9a71c`, tagged `v0.8.0`; this documentation finalization is
+  committed separately.
 * **Verified.** 236/236 server tests in 17 files, including the original 226/226 in 16
   files untouched; both typechecks 0; production build 0; `git diff --check` 0; 28/28
   committed real-Chrome checks against the built daemon with an editor token and the lobby

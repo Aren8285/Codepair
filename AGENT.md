@@ -10,6 +10,9 @@ Nothing is simulated: files are read and written on the Host's disk, the termina
 is a `node-pty` shell process, collaboration is a real Yjs CRDT over authenticated
 WebSockets, and calls use the browser's native `RTCPeerConnection`.
 
+Current release: **v0.8.0** (tag `v0.8.0`) adds coturn-compatible time-limited TURN
+credentials; the existing STUN/static `--ice-servers` configuration is unchanged.
+
 ```
 Host machine                                    Remote clients
 ┌──────────────────────────────────────┐        ┌──────────────────┐
@@ -446,7 +449,13 @@ npm start -- --root . --host 0.0.0.0
 
 Keep TURN credentials out of the UI: static and minted credentials are returned by
 `/api/session` only to authenticated clients, which mirrors how any client that may
-call needs them.
+call needs them. The raw coturn shared secret is server-only and never reaches the
+client. Minting is in `server/src/webrtc/turnCredentials.ts`; `/api/session` mints once
+per request and appends one TURN entry to `config.iceServers`.
+
+Startup fails with `ConfigError` when `--turn-secret` is present without a valid
+`--turn-urls` entry. This check is in `parseConfig()` and again at the first line of
+`createCodepairServer()`; neither listener is bound on failure.
 
 ## Networking
 

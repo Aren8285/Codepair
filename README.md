@@ -10,6 +10,8 @@ Nothing is simulated: files are read and written on the Host's disk, the termina
 and calls use the browser's native `RTCPeerConnection`. There is no cloud service in
 between — your browser talks straight to the Host.
 
+Current release: **v0.8.0** — time-limited coturn credentials for cross-NAT calls.
+
 ```
 Host machine                                    Remote clients
 ┌──────────────────────────────────────┐        ┌──────────────────┐
@@ -37,6 +39,10 @@ Host machine                                    Remote clients
   or remove someone from the call without closing their editor. Everyone can raise a
   hand. Mute is advisory: the target's own client disables its track, and "Muted by host"
   appears only after that local track is off.
+- **TURN for cross-NAT calls** — optionally point the daemon at a coturn
+  `static-auth-secret` and TURN URLs; every authenticated `/api/session` response gets a
+  freshly signed, short-lived username and credential. The raw secret never leaves the
+  server, and static `--ice-servers` remains supported.
 - **Sandboxed paths** — every client-supplied path passes lexical *and* realpath
   containment checks; sensitive names (`.git`, `node_modules`, `.env*`, keys) are hidden.
 - **Path access rules** — per-session `hidden` / `r` / `rw` glob rules, enforced at one
