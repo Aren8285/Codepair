@@ -5,8 +5,9 @@ import os from 'node:os';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { createAdminApp } from './admin/adminApp.js';
-import { ConfigError, generateToken, terminalBypassesRules, type ServerConfig } from './config.js';
+import { ConfigError, assertTurnConfig, generateToken, terminalBypassesRules, type ServerConfig } from './config.js';
 import { AppError, badRequest, unauthorized, toErrorPayload } from './errors.js';
+import { mintTurnCredential } from './webrtc/turnCredentials.js';
 import { DEFAULT_IGNORED } from './files/fileService.js';
 import { ConnectionRegistry } from './lobby/connections.js';
 import {
@@ -48,7 +49,7 @@ import {
 export { CAPABILITY_GATE, requireCap };
 export type { CapabilityGate } from './security/gate.js';
 
-export const SERVER_VERSION = '0.7.0';
+export const SERVER_VERSION = '0.8.0';
 
 declare global {
   namespace Express {
@@ -104,6 +105,8 @@ export async function createCodepairServer(
   config: ServerConfig,
   options: CreateServerOptions = {},
 ): Promise<CodepairServer> {
+  // Eager startup validation for programmatic callers that bypass parseConfig.
+  assertTurnConfig(config);
   const startedAt = Date.now();
 
   const ignored = new Set(DEFAULT_IGNORED);
@@ -291,6 +294,13 @@ export async function createCodepairServer(
     const principal = effectivePrincipal(session, principalOf(request), connectionId);
     const sandboxAvailable =
       config.terminalEnabled && session.terminals.interviewSandbox?.available === true;
+    // Mint once per response: no shared or cached credential is handed out.
+    const turn = config.turnSecret
+      ? mintTurnCredential(config.turnSecret, config.turnCredentialTtl)
+      : undefined;
+    const iceServers = turn
+      ? [...config.iceServers, { urls: config.turnUrls, username: turn.username, credential: turn.credential }]
+      : config.iceServers;
     response.setHeader('Cache-Control', 'no-store');
     response.json({
       role: principal.role,
@@ -305,7 +315,7 @@ export async function createCodepairServer(
       version: SERVER_VERSION,
       startedAt,
       limits: { maxFileBytes: config.maxFileBytes },
-      rtc: { iceServers: config.iceServers },
+      rtc: { iceServers },
       ...(principal.role === 'candidate'
         ? {
             interview: {

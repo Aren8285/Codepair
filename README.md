@@ -114,6 +114,9 @@ query strings, `Referer` headers or access logs.
 | `--confirm-unhide` | off | Required when a `--rule` lifts a built-in secret default |
 | `--tunnel <provider>` | off | `cloudflare` or `ngrok` public tunnel |
 | `--ice-servers <json>` | Google STUN | JSON `RTCIceServer[]`, max 8 entries |
+| `--turn-secret <secret>` | — | coturn `static-auth-secret`; prefer `CODE_PAIR_TURN_SECRET` so it stays out of shell history. Requires `--turn-urls` and fails at startup if they are missing or malformed |
+| `--turn-urls <url,url>` | — | Comma-separated `turn:`/`turns:` URLs; each `/api/session` response receives one fresh minted credential |
+| `--turn-credential-ttl <seconds>` | `3600` | Minted credential lifetime, 1–86400 |
 | `--allow-origin <origin>` | — | Extra origin allowed to open WebSockets |
 | `--dev-client <url>` | — | Vite origin used in the printed link and origin check |
 | `--quiet` | off | Less startup output |
@@ -121,6 +124,7 @@ query strings, `Referer` headers or access logs.
 Environment equivalents: `CODE_PAIR_MODE`, `CODE_PAIR_TOKEN`, `CODE_PAIR_PORT`,
 `CODE_PAIR_ADMIN_PORT`, `CODE_PAIR_HOST`, `CODE_PAIR_ALLOW_ORIGINS`, `CODE_PAIR_DEV_CLIENT`,
 `CODE_PAIR_TERMINAL=off`, `CODE_PAIR_TUNNEL`, `CODE_PAIR_ICE_SERVERS`,
+`CODE_PAIR_TURN_SECRET`, `CODE_PAIR_TURN_URLS`, `CODE_PAIR_TURN_CREDENTIAL_TTL`,
 `CODE_PAIR_MAX_FILE_BYTES`, `CODE_PAIR_SAVE_DEBOUNCE_MS`, `CODE_PAIR_IGNORE`,
 `CODE_PAIR_INTERVIEW_SANDBOX_IMAGE`, `CODE_PAIR_CLIENT_DIST`.
 
@@ -534,14 +538,26 @@ page cannot read, and JSON bodies require a CORS preflight.
   `--tunnel cloudflare`/`--tunnel ngrok` for automatic HTTPS.
   Set `CODE_PAIR_NO_SSL=1` to disable the self-signed cert if you only use
   localhost.
-- **Calls between different networks fail without TURN** — the default ICE config is
-  Google STUN only. Supply TURN via `--ice-servers` for reliable cross-NAT calls:
+- **Calls between different networks need TURN** — the default ICE config is Google
+  STUN only. Supply static TURN credentials via `--ice-servers` for reliable
+  cross-NAT calls:
 
 ```bash
 CODE_PAIR_ICE_SERVERS='[
   {"urls":"stun:stun.l.google.com:19302"},
   {"urls":"turn:turn.example.com:3478","username":"user","credential":"pass"}
 ]' npm start -- --root . --host 0.0.0.0
+```
+
+  For time-limited credentials, configure coturn with the same
+  `static-auth-secret` and give the daemon the secret plus its URLs. The secret
+  stays on the server; every authenticated `/api/session` response receives a
+  freshly signed username/credential with the configured TTL:
+
+```bash
+CODE_PAIR_TURN_SECRET='<coturn-static-auth-secret>' \
+CODE_PAIR_TURN_URLS='turn:turn.example.com:3478,turns:turn.example.com:5349' \
+npm start -- --root . --host 0.0.0.0
 ```
 
 - **Public tunnels require the provider CLI** (`cloudflared` or `ngrok`) to be installed
@@ -561,7 +577,7 @@ CODE_PAIR_ICE_SERVERS='[
 
 ## Testing
 
-Currently 226 server tests (16 files) and 28 browser checks. The suite covers the original
+Currently 236 server tests (17 files) and 28 browser checks. The suite covers the original
 single-room behavior plus room creation, selector-vs-credential isolation, cross-room
 connection ids, room invites, scoped root switches, deletion teardown, call moderation
 (grants, mute relay, spotlight, hand raise and call-only removal), and the interview
@@ -604,8 +620,9 @@ layout, and one-use invite redemption under StrictMode. `devices.mjs` checks ove
 - LAN access: use `--host 0.0.0.0` — the daemon lists every non-internal IPv4 address
   with a ready-to-open link, and warns that anyone on the network with the link has the
   access you granted. Open the port in your firewall.
-- Keep TURN credentials out of the UI: they are returned by `/api/session` only to
-  authenticated clients.
+- Keep TURN credentials out of the UI: static and minted credentials are returned by
+  `/api/session` only to authenticated clients. The coturn shared secret is never
+  returned or printed; minted usernames/credentials expire on the TTL.
 
 ## License
 

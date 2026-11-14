@@ -28,7 +28,7 @@ Host machine                                    Remote clients
 | --- | --- |
 | `server/src/index.ts` | CLI entry point, tunnel lifecycle, signals (banner lives in `banner.ts`) |
 | `server/src/banner.ts` | `buildBanner()`: startup banner, terminal-bypass warning, LAN/tunnel links |
-| `server/src/config.ts` | Flag/env parsing, token and room-id generation, ICE config |
+| `server/src/config.ts` | Flag/env parsing, token and room-id generation, ICE/TURN config, eager TURN validation |
 | `server/src/server.ts` | Express app, all HTTP routes, WebSocket upgrade routing |
 | `server/src/security/auth.ts` | Constant-time token compare, bearer header, WS subprotocol, origin check |
 | `server/src/security/pathGuard.ts` | Lexical **and** realpath containment for every path |
@@ -52,6 +52,7 @@ Host machine                                    Remote clients
 | `server/src/interview/interviewStore.ts` | Candidate consent map, bounded integrity event ring and replay payload |
 | `server/src/terminal/shellEnv.ts` | Minimal scrubbed environment + generated rc files |
 | `server/src/signaling/signalingHub.ts` | Room-scoped offer/answer/candidate relay plus live-socket moderator grants, mute requests, spotlight, hand raise and call-only removal |
+| `server/src/webrtc/turnCredentials.ts` | coturn REST credential minting: `<expiry>:<label>` + base64 HMAC-SHA1, random per call |
 | `server/src/tunnel.ts` | `cloudflared` / `ngrok` child process, URL discovery, teardown |
 | `client/src/App.tsx` | Session lifecycle, layout, tabs, tree state, shortcuts |
 | `client/src/lib/docProvider.ts` | Authenticated Yjs provider (sync + awareness + save) |
@@ -62,7 +63,7 @@ Host machine                                    Remote clients
 | `client/src/host/*`, `client/host.html` | Host console UI: separate Vite entry, responsive page-level control room served only by the admin listener |
 | `client/src/lib/calls.ts` | Peer mesh, media state, screen share, moderation actions and "muted by host" handling |
 | `client/src/components/*` | IDE chrome: TopBar, FileTree, EditorPane, TerminalPanel, CallDock, dialogs |
-| `server/test/*` | 226 Vitest tests: sandboxing, policy, API, admin, capabilities, lobby, invites, rooms, doc sync, terminal, signalling and interview safety |
+| `server/test/*` | 236 Vitest tests: sandboxing, policy, API, admin, capabilities, lobby, invites, rooms, doc sync, terminal, signalling, interview safety and TURN credentials |
 | `REPORT.md` | Final implementation report: verified features, tests, limitations, remaining work |
 | `e2e/browser.mjs` | Two-client headless-Chrome test of the real UI |
 
@@ -108,6 +109,9 @@ never travels in query strings, Referer headers or access logs.
 | `--confirm-unhide` | off | Required when a `--rule` lifts a built-in secret default |
 | `--tunnel <provider>` | off | `cloudflare` or `ngrok` |
 | `--ice-servers <json>` | Google STUN | JSON `RTCIceServer[]`, max 8 entries |
+| `--turn-secret <secret>` | — | coturn `static-auth-secret`; prefer env. Requires `--turn-urls` |
+| `--turn-urls <url,url>` | — | `turn:`/`turns:` URLs for fresh per-session credentials |
+| `--turn-credential-ttl <seconds>` | `3600` | Minted credential lifetime, 1–86400 |
 | `--allow-origin <origin>` | — | Extra origin allowed to open WebSockets |
 | `--dev-client <url>` | — | Vite origin used in the printed link and origin check |
 | `--quiet` | off | Less startup output |
@@ -115,6 +119,7 @@ never travels in query strings, Referer headers or access logs.
 Environment equivalents: `CODE_PAIR_MODE`, `CODE_PAIR_TOKEN`, `CODE_PAIR_PORT`, `CODE_PAIR_ADMIN_PORT`,
 `CODE_PAIR_HOST`, `CODE_PAIR_ALLOW_ORIGINS`, `CODE_PAIR_DEV_CLIENT`,
 `CODE_PAIR_TERMINAL=off`, `CODE_PAIR_TUNNEL`, `CODE_PAIR_ICE_SERVERS`,
+`CODE_PAIR_TURN_SECRET`, `CODE_PAIR_TURN_URLS`, `CODE_PAIR_TURN_CREDENTIAL_TTL`,
 `CODE_PAIR_MAX_FILE_BYTES`, `CODE_PAIR_SAVE_DEBOUNCE_MS`, `CODE_PAIR_IGNORE`,
 `CODE_PAIR_INTERVIEW_SANDBOX_IMAGE`, `CODE_PAIR_CLIENT_DIST`.
 
@@ -425,17 +430,23 @@ with only the project mounted, or keep the session read-only.
 * Media is only requested when the user activates mic, camera or screen share —
   opening the call panel alone captures nothing.
 * Default ICE config is Google's public STUN server. **Cross-NAT calls will fail
-  without TURN.** Supply TURN via `--ice-servers`:
+  without TURN.** Supply static TURN via `--ice-servers`, or configure coturn's
+  REST API:
 
 ```bash
-CODE_PAIR_ICE_SERVERS='[
-  {"urls":"stun:stun.l.google.com:19302"},
-  {"urls":"turn:turn.example.com:3478","username":"user","credential":"pass"}
-]' npm start -- --root . --host 0.0.0.0
+CODE_PAIR_TURN_SECRET='<static-auth-secret>' \
+CODE_PAIR_TURN_URLS='turn:turn.example.com:3478' \
+npm start -- --root . --host 0.0.0.0
 ```
 
-Keep TURN credentials out of the UI: they are returned by `/api/session` only to
-authenticated clients, which mirrors how any client that may call needs them.
+  `parseConfig` and `createCodepairServer` both reject a secret without at least
+  one valid `turn:`/`turns:` URL before either listener binds. The shared secret
+  is never returned or logged; `/api/session` receives a fresh HMAC-SHA1-signed
+  username and credential per request, valid for `--turn-credential-ttl` seconds.
+
+Keep TURN credentials out of the UI: static and minted credentials are returned by
+`/api/session` only to authenticated clients, which mirrors how any client that may
+call needs them.
 
 ## Networking
 
@@ -454,7 +465,7 @@ authenticated clients, which mirrors how any client that may call needs them.
 
 ```bash
 npm run typecheck     # tsc for server + client
-npm test              # Vitest: 226 tests — sandbox, policy, API, admin, lobby, invites, rooms, moderation, interview, doc sync, terminal
+npm test              # Vitest: 236 tests — sandbox, policy, API, admin, lobby, invites, rooms, moderation, interview, doc sync, terminal, TURN
 npm run build         # Vite client build + tsup server bundle
 npm run dev           # tsx watch server + Vite client
 ```

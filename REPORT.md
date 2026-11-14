@@ -1,13 +1,13 @@
 # CodePair — Implementation Report
 
-Version 0.7.0 · macOS arm64 · Node v22.21.1 · npm 10.9.4 · release commit `4e40f7d`
+Version 0.8.0 · macOS arm64 · Node v22.21.1 · npm 10.9.4 · uncommitted review tree (0.7.0 release commit `4e40f7d`)
 
 Base report written at 0.2.0; §1 and §3 are kept current, and the addendum at the end
 records each iteration (0.3.x: host console API, host principal, path policy; 0.4.0: join
 lobby, kick/lock, Host console UI; 0.5.0: expiring invites, live token rotation, tunnel
 status/QR; 0.6.0: room registry, room-scoped administration, call moderation; 0.7.0:
 interview profile, consent-gated integrity signals, replay data, Docker-only candidate
-terminal).
+terminal; 0.8.0: coturn-compatible time-limited TURN credentials).
 
 This report states what was built, what was actually verified (and how), what
 was not verified, and what remains. Nothing below is claimed as working on the
@@ -27,6 +27,7 @@ real processes, or real browser clients.
 | Monaco integration | Built, verified | `client/src/lib/monaco.ts`, `components/EditorPane.tsx` |
 | Yjs collaboration + presence | Built, verified | `server/src/documents/documentHub.ts`, `client/src/lib/docProvider.ts` |
 | Room-scoped WebRTC signalling | Built, verified at signalling layer | `server/src/signaling/signalingHub.ts`, `client/src/lib/calls.ts` |
+| Coturn-compatible TURN credentials | Built; minting/config verified, relay not exercised | `server/src/webrtc/turnCredentials.ts`, `server/src/config.ts`, `server/src/server.ts` |
 | Call moderation | Built; server verified, UI not browser-exercised | `server/src/signaling/signalingHub.ts`, `client/src/lib/calls.ts`, `components/CallDock.tsx` |
 | WebRTC media (voice/video/screen) | Implemented, **not** verified end-to-end | `client/src/lib/calls.ts`, `components/CallDock.tsx` |
 | LAN connectivity | Built, verified | `server/src/index.ts` (`--host 0.0.0.0`) |
@@ -46,7 +47,7 @@ real processes, or real browser clients.
 | Consent-gated integrity signals + replay data | Built, verified at API/data layer | `server/src/interview/interviewStore.ts`, `client/src/lib/integrity.ts` |
 | Docker-only candidate terminal | Built, verified with injected Docker/spawn seams | `server/src/terminal/interviewSandbox.ts`, `terminalService.ts` |
 | Candidate consent UI | Built, browser-verified in a temporary 13-check pass | `client/src/components/ConsentScreen.tsx`, `client/src/App.tsx` |
-| Automated tests | 226 server + 28 committed browser checks | `server/test/*`, `e2e/browser.mjs` |
+| Automated tests | 236 server + 28 committed browser checks | `server/test/*`, `e2e/browser.mjs` |
 | Installation / environment docs | Written | `AGENT.md` |
 | This report | Written | `REPORT.md` |
 
@@ -85,7 +86,7 @@ Full detail lives in [AGENT.md](AGENT.md).
 
 ## 3. Tests executed
 
-### Server suite — 226 tests, all passing
+### Server suite — 236 tests, all passing
 
 ```
 ✓ test/admin.test.ts       (26)  loopback guards, token separation, root switch, route audit, rotation, tunnel
@@ -104,6 +105,8 @@ Full detail lives in [AGENT.md](AGENT.md).
 ✓ test/rooms.test.ts      ( 6)  creation, token isolation, selector-only auth, cross-room ids, room invites, scoped switch/delete
 ✓ test/interview.test.ts  ( 9)  candidate caps/policy, consent gate, bounded events, role ceiling, replay, symlink escape
 ✓ test/interviewTerminal.test.ts (2) exact Docker flags/mounts, fail-closed 4403, zero host spawns, no fallback
+✓ test/turnCredentials.test.ts (10) HMAC fixture, expiry, default/configured TTL, STUN baseline,
+  fresh per-session entries, additive --ice-servers, secret leaks, startup validation, server construction
 ```
 
 Notable security assertions:
@@ -860,3 +863,51 @@ fallback) — that decision decides how much of §8.2 lands in phase 1 vs phase 
   No real tunnel, WebRTC media, screen-share capture, PathGuard internals, FileService
   policy internals, Yjs sync internals, signalling payloads, room isolation semantics or
   lobby/kick/lock algorithms were changed.
+
+### 0.8.0 — coturn-compatible TURN credentials (2026-11-14, uncommitted)
+
+* **Minting.** `server/src/webrtc/turnCredentials.ts` implements coturn's REST-API
+  format: `username = <unixExpiry>:<random label>`, `credential = base64(HMAC-SHA1(
+  static-auth-secret, username))`. The default TTL is 3600 seconds; the clock is
+  injectable for tests. `createHmac` from Node's standard library is the only new import.
+* **Session wiring.** `/api/session` calls the minter once per authenticated request and
+  appends exactly one `iceServers` entry carrying all configured TURN URLs. The existing
+  STUN/`--ice-servers` array is never mutated or replaced. Without `turnSecret`, the
+  response is byte-for-byte the previous `config.iceServers` array.
+* **Eager startup validation.** `assertTurnConfig()` runs at `server/src/config.ts:235`
+  inside `parseConfig()`, before the config object is returned, and as the first statement
+  of `createCodepairServer()` at `server/src/server.ts:109`, before any Express app, probe,
+  port bind or timer is created. The CLI calls `parseConfig()` at `server/src/index.ts:64`
+  before `createCodepairServer()` and `server.start()` at lines 66–67. A secret without at least
+  one valid `turn:`/`turns:` URL throws `ConfigError`; so does an empty secret, a
+  non-URL, a non-integer TTL, or a TTL outside 1–86400. The CLI's `main()` calls
+  `parseConfig()` before `createCodepairServer()` and `server.start()`, so the process
+  exits 1 with a configuration error and never binds either listener. The startup error
+  text never contains the secret.
+* **Secret hygiene.** The raw secret stays in `ServerConfig` and is only passed to the
+  HMAC. It is never included in `/api/session`, admin responses, HTTP headers, document
+  or signalling WebSocket frames, the banner, stdout/stderr or errors. Minted
+  usernames/credentials do reach authenticated clients by design; no new route was added.
+* **Version/docs.** Root, server and client manifests are 0.8.0; `SERVER_VERSION`,
+  `--version` and the token gate label are 0.8.0. `README.md`, `AGENT.md` and the CLI help
+  document the flags, env names and coturn setup. The dependency set is unchanged.
+* **Verified.** 236/236 server tests in 17 files, including the original 226/226 in 16
+  files untouched; both typechecks 0; production build 0; `git diff --check` 0; 28/28
+  committed real-Chrome checks against the built daemon with an editor token and the lobby
+  enabled. (The first two browser invocations were invalid harness setups: one omitted the
+  editor token, and one used `--no-lobby`, so the invite checks could not exercise their
+  intended path; the corrected run passed.) The built daemon was also started with a marker secret: its two live `/api/session` responses each
+  carried the configured TURN URLs, had distinct usernames, and contained no secret in
+  either body, the document/signalling WebSocket frames, or the process log. Missing-URL and malformed-URL CLI starts both exited 1
+  with `Configuration error` and no secret in stdout/stderr. Mutation 1 (replace HMAC with
+  `INVALID`) made the hand-computed fixture test red; mutation 3 (replace the random label
+  with a fixed label) made the two-request freshness test red; both files were restored
+  byte-identically (SHA-256 `fea1c6c…ac3cdb3`). Mutation 2 is not applicable: there is no
+  redaction guard to remove because the secret never enters response/log construction.
+* **Limitations.** Docker, Podman, Colima and native coturn are all absent from this
+  environment, so no real coturn container was started. The checks that could not run are:
+  live TURN-allocation success against coturn, a browser `relay` candidate in
+  `chrome://webrtc-internals`, a TURN-only two-peer call, and coturn's rejection of an
+  expired username. Minting correctness is covered by an independently computed
+  HMAC-SHA1 fixture; WebRTC negotiation, PathGuard, FileService, Yjs, room registry,
+  lobby/kick/lock, invites/rotation and the interview profile were not changed.

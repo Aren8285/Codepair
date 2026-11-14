@@ -29,6 +29,9 @@ Options:
   --confirm-unhide          Let --rule lift a built-in secret default
   --tunnel <provider>       "cloudflare" or "ngrok" public tunnel
   --ice-servers <json>      JSON array of RTCIceServer objects (STUN/TURN)
+  --turn-secret <secret>    coturn static-auth-secret; prefer CODE_PAIR_TURN_SECRET
+  --turn-urls <url,url>     TURN service URLs; required when --turn-secret is set
+  --turn-credential-ttl <s> Minted credential lifetime, 1-86400 (default: 3600)
   --dev-client <url>        Vite dev server origin, used in the printed link
   --quiet                   Less startup output
   --help                    Show this help
@@ -37,7 +40,8 @@ Options:
 Environment:
   CODE_PAIR_MODE, CODE_PAIR_TOKEN, CODE_PAIR_PORT, CODE_PAIR_ADMIN_PORT, CODE_PAIR_HOST,
   CODE_PAIR_ALLOW_ORIGINS, CODE_PAIR_DEV_CLIENT, CODE_PAIR_TERMINAL=off,
-  CODE_PAIR_TUNNEL, CODE_PAIR_ICE_SERVERS, CODE_PAIR_MAX_FILE_BYTES,
+  CODE_PAIR_TUNNEL, CODE_PAIR_ICE_SERVERS, CODE_PAIR_TURN_SECRET, CODE_PAIR_TURN_URLS,
+  CODE_PAIR_TURN_CREDENTIAL_TTL, CODE_PAIR_MAX_FILE_BYTES,
   CODE_PAIR_SAVE_DEBOUNCE_MS, CODE_PAIR_IGNORE, CODE_PAIR_INTERVIEW_SANDBOX_IMAGE
 
 Security note:
@@ -53,7 +57,7 @@ async function main(): Promise<void> {
     return;
   }
   if (argv.includes('--version')) {
-    process.stdout.write('0.7.0\n');
+    process.stdout.write('0.8.0\n');
     return;
   }
 

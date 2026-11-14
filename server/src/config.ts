@@ -53,6 +53,12 @@ export interface ServerConfig {
   /** A pending lobby entry expires after this long (`--lobby-timeout`). */
   lobbyTimeoutMs: number;
   iceServers: IceServerConfig[];
+  /** TURN shared secret; server-only. When set, a fresh credential is minted per session response. */
+  turnSecret?: string;
+  /** TURN service addresses configured by the Host. */
+  turnUrls: string[];
+  /** Lifetime of a minted TURN credential, in seconds. */
+  turnCredentialTtl: number;
   tunnelProvider?: TunnelProvider;
   clientDist: string;
   quiet: boolean;
@@ -73,6 +79,38 @@ export function generateToken(): string {
 export function generateRoomId(): string {
   const hex = randomBytes(4).toString('hex');
   return `${hex.slice(0, 4)}-${hex.slice(4)}`;
+}
+
+export interface TurnSettings {
+  turnSecret?: string;
+  turnUrls: string[];
+  turnCredentialTtl: number;
+}
+
+/**
+ * Validate TURN settings eagerly. This is called by parseConfig before the
+ * daemon binds either port, and by createCodepairServer for callers that
+ * construct a ServerConfig without going through the CLI parser.
+ */
+export function assertTurnConfig(settings: TurnSettings): void {
+  if (
+    !Number.isInteger(settings.turnCredentialTtl) ||
+    settings.turnCredentialTtl < 1 ||
+    settings.turnCredentialTtl > 86_400
+  ) {
+    throw new ConfigError('--turn-credential-ttl must be an integer between 1 and 86400 seconds.');
+  }
+  if (settings.turnSecret === undefined) return;
+  if (!settings.turnSecret.trim()) {
+    throw new ConfigError('--turn-secret must not be empty.');
+  }
+  if (settings.turnUrls.length === 0) {
+    throw new ConfigError('--turn-secret requires at least one --turn-urls entry.');
+  }
+  const malformed = settings.turnUrls.find((url) => !/^turns?:\S+$/i.test(url));
+  if (malformed !== undefined) {
+    throw new ConfigError(`Invalid TURN URL "${malformed}". Expected a turn: or turns: URL.`);
+  }
 }
 
 export function parseConfig(
@@ -183,6 +221,19 @@ export function parseConfig(
     throw new ConfigError('A --rule exposes a built-in secret default; pass --confirm-unhide to allow it.');
   }
 
+  if (flags['turn-secret'] === true) throw new ConfigError('--turn-secret requires a value.');
+  if (flags['turn-urls'] === true) throw new ConfigError('--turn-urls requires a value.');
+  if (flags['turn-credential-ttl'] === true) throw new ConfigError('--turn-credential-ttl requires a value.');
+  const turnSecret = flagValue(flags, 'turn-secret') ?? env.CODE_PAIR_TURN_SECRET;
+  const turnUrls = (flagValue(flags, 'turn-urls') ?? env.CODE_PAIR_TURN_URLS ?? '')
+    .split(',')
+    .map((url) => url.trim())
+    .filter(Boolean);
+  const turnCredentialTtl = Number(
+    flagValue(flags, 'turn-credential-ttl') ?? env.CODE_PAIR_TURN_CREDENTIAL_TTL ?? 3600,
+  );
+  assertTurnConfig({ turnSecret, turnUrls, turnCredentialTtl });
+
   return {
     root,
     host,
@@ -207,6 +258,9 @@ export function parseConfig(
     lobbyEnabled,
     lobbyTimeoutMs,
     iceServers: parseIceServers(flagValue(flags, 'ice-servers') ?? env.CODE_PAIR_ICE_SERVERS),
+    turnSecret,
+    turnUrls,
+    turnCredentialTtl,
     tunnelProvider: tunnelRaw as TunnelProvider | undefined,
     clientDist: path.resolve(
       env.CODE_PAIR_CLIENT_DIST ??
